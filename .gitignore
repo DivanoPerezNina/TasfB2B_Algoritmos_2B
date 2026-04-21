@@ -39,6 +39,5 @@ datos/
 *.csv
 
 ### IntelliJ IDEA (Archivos de proyecto local) ###
-# Asegurarnos de que no se suban configuraciones locales que choquen con las de tu compañero
 .idea/
 *.iml

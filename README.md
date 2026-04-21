@@ -41,4 +41,5 @@ Estamos utilizando una estrategia de ramas aislada para evitar conflictos durant
 * **`feat/alns`**: Rama para el desarrollo exclusivo del algoritmo ALNS.
 * **`exp/comparacion`**: Rama de convergencia donde fusionaremos ambos algoritmos para realizar la Experimentación Numérica (comparación de tiempos de CPU y tasas de éxito).
 
-**Regla de Oro:** ¡Nunca hagas commit directamente en `main` si estás tocando lógica de los algoritmos!
+> [!IMPORTANT]
+> ¡Nunca hagas commit directamente en `main` si estás tocando lógica de los algoritmos!
