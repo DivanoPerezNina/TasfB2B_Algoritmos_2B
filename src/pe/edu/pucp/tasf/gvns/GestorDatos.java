@@ -1,4 +1,4 @@
-package pe.edu.pucp.tasf;
+package pe.edu.pucp.tasf.gvns;
 
 import java.io.BufferedReader;
 import java.io.File;
