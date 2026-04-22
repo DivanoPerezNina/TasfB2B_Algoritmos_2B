@@ -83,7 +83,23 @@ public class GestorDatos {
     public void cargarAeropuertos(String path) throws IOException {
         // Archivo en UTF-16 con BOM
         List<String> lines = Files.readAllLines(Paths.get(path), StandardCharsets.UTF_16);
+        String continenteActual = "Unknown";
         for (String line : lines) {
+            String limpia = line.trim();
+            String lower = limpia.toLowerCase(Locale.ROOT);
+            if (lower.contains("america")) {
+                continenteActual = "America";
+                continue;
+            }
+            if (lower.contains("europa")) {
+                continenteActual = "Europa";
+                continue;
+            }
+            if (lower.contains("asia")) {
+                continenteActual = "Asia";
+                continue;
+            }
+
             if (line.trim().isEmpty() || !line.matches("^\\d{2}\\s+.*")) continue;
             try {
                 // Formato: 12   EBCI   Bruselas            Belgica         brus    +2     440
@@ -98,7 +114,7 @@ public class GestorDatos {
                     int cap = Integer.parseInt(partes[6]); // capacidad 
                     int gmt = Integer.parseInt(partes[5]); // GMT
                     
-                    String continente = "Unknown";
+                    String continente = continenteActual;
                     aeropuertos.put(iata, new Aeropuerto(iata, gmt * 60, cap, continente));
                 }
             } catch (NumberFormatException e) {
@@ -157,7 +173,21 @@ public class GestorDatos {
                             int day = Integer.parseInt(fecha.substring(6, 8));
                             
                             ZonedDateTime registro = ZonedDateTime.of(year, month, day, hh, mm, 0, 0, ZoneOffset.UTC);
-                            ZonedDateTime deadline = registro.plusHours(24);
+                            String continenteOrigen = "Unknown";
+                            Aeropuerto aeroOrigen = aeropuertos.get(origen);
+                            if (aeroOrigen != null && aeroOrigen.continente != null) {
+                                continenteOrigen = aeroOrigen.continente;
+                            }
+
+                            String continenteDestino = "Unknown";
+                            Aeropuerto aeroDestino = aeropuertos.get(destino);
+                            if (aeroDestino != null && aeroDestino.continente != null) {
+                                continenteDestino = aeroDestino.continente;
+                            }
+
+                            boolean mismoContinente = continenteOrigen.equalsIgnoreCase(continenteDestino)
+                                    && !"Unknown".equalsIgnoreCase(continenteOrigen);
+                            ZonedDateTime deadline = registro.plusHours(mismoContinente ? 24 : 48);
                             
                             envios.add(new Envio(id, origen, destino, maletas, registro, deadline));
                             count++;

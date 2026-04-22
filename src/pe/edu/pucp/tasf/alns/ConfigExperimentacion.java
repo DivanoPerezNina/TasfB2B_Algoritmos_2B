@@ -17,6 +17,7 @@ public class ConfigExperimentacion {
     public double coolingRate = 0.999;
     public int maxSaltos = 3;
     public int tiempoMinEscalaMin = 10;
+    public boolean sequentialOnly = false; // Opción para ejecutar solo versión secuencial (más rápido para pruebas)
 
     // Pesos para función objetivo
     public long pesoUnassigned = 1_000_000;
@@ -35,6 +36,18 @@ public class ConfigExperimentacion {
         if (argMap.containsKey("iteraciones")) iteraciones = Integer.parseInt(argMap.get("iteraciones"));
         if (argMap.containsKey("threads")) threads = Integer.parseInt(argMap.get("threads"));
         if (argMap.containsKey("seed")) seed = Long.parseLong(argMap.get("seed"));
+        if (argMap.containsKey("sequential-only")) sequentialOnly = true;
+        
+        // Auto-tune moderado para datasets pequeños: reducir iteraciones conservadoramente
+        if (maxEnvios <= 100) {
+            iteraciones = Math.min(iteraciones, 5000);  // 5K es suficiente para 100 envíos
+        } else if (maxEnvios <= 500) {
+            iteraciones = Math.min(iteraciones, 12000);
+        } else if (maxEnvios <= 1000) {
+            iteraciones = Math.min(iteraciones, 22000);
+        } else if (maxEnvios <= 5000) {
+            iteraciones = Math.min(iteraciones, 32000);
+        }
     }
 
     private Map<String, String> parseArgs(String[] args) {

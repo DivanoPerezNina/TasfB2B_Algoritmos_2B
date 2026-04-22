@@ -37,37 +37,67 @@ public class PlanificadorALNS {
         SolucionALNS best = new SolucionALNS(current);
         evaluador.actualizarOcupacion(current);
         current.calcularObjective(config);
-        best.calcularObjective(config);
+        best = new SolucionALNS(current);
+
+        final boolean fastMode = current.rutas.size() >= 200_000;
+        final int evalStride = fastMode ? 25 : Math.max(1, config.iteraciones / 20); // Más agresivo: recalc cada 5%
+        
+        // Cache inicial de contador de asignados
+        int numAsignados = 0;
+        for (RutaEnvio r : current.rutas) {
+            if (r.estado != RutaEnvio.Estado.UNASSIGNED) numAsignados++;
+        }
 
         for (int iter = 0; iter < config.iteraciones; iter++) {
             // Seleccionar destroy
             int dIdx = seleccionarOperador(pesosDestroy, rand);
             // Seleccionar repair
             int rIdx = seleccionarOperador(pesosRepair, rand);
+            long objectiveAntes = current.objective;
 
-            // Destroy
-            int numRemove = 5 + rand.nextInt(16); // 5-20%
-            List<RutaEnvio> removidos = destroys[dIdx].destroy(current, rand, numRemove);
+            // Destroy - adaptar porcentaje de remoción moderadamente según tamaño dataset
+            int numRemove;
+            if (numAsignados <= 100) {
+                // Para datasets muy pequeños: 2-8% (rápido pero con exploración)
+                numRemove = 2 + rand.nextInt(7);
+            } else if (numAsignados <= 1000) {
+                // Para datasets pequeños: 3-12% (exploración equilibrada)
+                numRemove = 3 + rand.nextInt(10);
+            } else {
+                // Para datasets grandes: 5-20% (comportamiento original)
+                numRemove = 5 + rand.nextInt(16);
+            }
+            List<RutaBackup> removidos = destroys[dIdx].destroy(current, rand, numRemove);
+            List<RutaEnvio> rutasRemovidas = new ArrayList<>(removidos.size());
+            for (RutaBackup rb : removidos) {
+                rutasRemovidas.add(rb.ruta);
+            }
 
             // Repair
-            repairs[rIdx].repair(current, removidos, datos, config, rand);
+            repairs[rIdx].repair(current, rutasRemovidas, datos, config, rand);
 
             // Evaluar
-            evaluador.actualizarOcupacion(current);
+            boolean recalcOcupacion = (iter % evalStride == 0);
+            if (recalcOcupacion) {
+                evaluador.actualizarOcupacion(current);
+            }
             current.calcularObjective(config);
+            long delta = current.objective - objectiveAntes;
 
             // Aceptación
             boolean accepted = false;
-            if (current.objective < best.objective) {
-                best = new SolucionALNS(current);
+            if (delta < 0) {
                 accepted = true;
                 actualizarPesos(dIdx, rIdx, 1); // sigma1
-            } else if (current.objective <= current.objective) { // mejora o igual
+                if (current.objective < best.objective) {
+                    best = new SolucionALNS(current);
+                }
+            } else if (delta == 0) {
                 accepted = true;
                 actualizarPesos(dIdx, rIdx, 2); // sigma2
             } else {
                 // Simulated Annealing
-                double prob = Math.exp((current.objective - current.objective) / temperatura);
+                double prob = Math.exp(-((double) delta) / Math.max(temperatura, 1e-9));
                 if (rand.nextDouble() < prob) {
                     accepted = true;
                     actualizarPesos(dIdx, rIdx, 3); // sigma3
@@ -76,10 +106,22 @@ public class PlanificadorALNS {
                 }
             }
 
-            if (accepted) {
-                // current ya actualizado
-            } else {
-                // Revertir? Para simplicidad, no revertir, asumir repair siempre mejora
+            if (!accepted) {
+                for (RutaBackup rb : removidos) {
+                    rb.restore();
+                }
+                if (recalcOcupacion) {
+                    evaluador.actualizarOcupacion(current);
+                    current.calcularObjective(config);
+                } else {
+                    current.objective = objectiveAntes;
+                }
+            }
+
+            // Actualizar contador de asignados solo si cambió el estado de alguna ruta
+            numAsignados = 0;
+            for (RutaEnvio r : current.rutas) {
+                if (r.estado != RutaEnvio.Estado.UNASSIGNED) numAsignados++;
             }
 
             // Cooling
@@ -88,7 +130,7 @@ public class PlanificadorALNS {
             // Actualizar métricas operadores
             metricas.seleccionDestroy[dIdx]++;
             if (accepted) metricas.acceptedDestroy[dIdx]++;
-            if (current.objective < best.objective) metricas.improvementDestroy[dIdx]++;
+            if (current.objective == best.objective) metricas.improvementDestroy[dIdx]++;
             // Similar para repair
         }
 
@@ -101,7 +143,8 @@ public class PlanificadorALNS {
     }
 
     private int seleccionarOperador(double[] pesos, Random rand) {
-        double total = Arrays.stream(pesos).sum();
+        double total = 0.0;
+        for (double peso : pesos) total += peso;
         double r = rand.nextDouble() * total;
         double cum = 0;
         for (int i = 0; i < pesos.length; i++) {

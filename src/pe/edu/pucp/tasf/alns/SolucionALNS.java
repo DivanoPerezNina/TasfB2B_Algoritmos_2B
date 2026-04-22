@@ -6,7 +6,7 @@ import java.util.*;
  */
 public class SolucionALNS {
     public List<RutaEnvio> rutas = new ArrayList<>();
-    public Map<String, Integer> ocupacionVuelos = new HashMap<>(); // clave: vueloId + dia
+    public Map<String, Integer> ocupacionVuelos = new HashMap<>(); // clave: origen-destino-salida-llegada_dia
     public Map<String, Integer> ocupacionAlmacen = new HashMap<>(); // por aeropuerto
     public long objective;
 
