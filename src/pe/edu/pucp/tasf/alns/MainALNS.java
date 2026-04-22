@@ -30,31 +30,40 @@ public class MainALNS {
         PlanificadorALNS plannerSeq = new PlanificadorALNS(datos, config);
         ResultadoEjecucion resSeq = plannerSeq.ejecutar(inicial);
 
-        // ALNS concurrente
-        PlanificadorALNSConcurrente plannerConc = new PlanificadorALNSConcurrente(datos, config);
-        ResultadoEjecucion resConc = plannerConc.ejecutar(inicial);
+        // ALNS concurrente (solo si no es sequential-only)
+        ResultadoEjecucion resConc = null;
+        if (!config.sequentialOnly) {
+            PlanificadorALNSConcurrente plannerConc = new PlanificadorALNSConcurrente(datos, config);
+            resConc = plannerConc.ejecutar(inicial);
+        }
 
         // Imprimir resúmenes
         imprimirResumen(resSeq);
-        imprimirResumen(resConc);
+        if (resConc != null) {
+            imprimirResumen(resConc);
+        }
 
         // Comparacion de resultados
-        System.out.println("");
-        System.out.println("==========================================");
-        System.out.println("COMPARACION DE VERSIONES");
-        System.out.println("==========================================");
-        System.out.println("Costo secuencial: " + resSeq.metricas.bestObjective);
-        System.out.println("Costo concurrente: " + resConc.metricas.bestObjective);
-        System.out.println("Tiempo secuencial: " + String.format("%.3f", resSeq.tiempoSeg) + " s");
-        System.out.println("Tiempo concurrente: " + String.format("%.3f", resConc.tiempoSeg) + " s");
-        double speedup = resSeq.tiempoSeg / resConc.tiempoSeg;
-        System.out.println("Aceleracion (speedup): " + String.format("%.2f", speedup) + "x");
-        String mejor = (resSeq.metricas.bestObjective <= resConc.metricas.bestObjective ? "Secuencial" : "Concurrente");
-        System.out.println("Mejor solucion: " + mejor + " (menor costo)");
-        System.out.println("");
-        System.out.println("Nota: El 'costo' mide penalizaciones por envios sin asignar y atrasados.");
-        System.out.println("Un costo mas bajo significa una solucion mejor.");
-        System.out.println("==========================================");
+        if (resConc != null) {
+            System.out.println("");
+            System.out.println("==========================================");
+            System.out.println("COMPARACION DE VERSIONES");
+            System.out.println("==========================================");
+            System.out.println("Costo secuencial: " + resSeq.metricas.bestObjective);
+            System.out.println("Costo concurrente: " + resConc.metricas.bestObjective);
+            System.out.println("Tiempo secuencial: " + String.format("%.3f", resSeq.tiempoSeg) + " s");
+            System.out.println("Tiempo concurrente: " + String.format("%.3f", resConc.tiempoSeg) + " s");
+            double speedup = resSeq.tiempoSeg / resConc.tiempoSeg;
+            System.out.println("Aceleracion (speedup): " + String.format("%.2f", speedup) + "x");
+            String mejor = (resSeq.metricas.bestObjective <= resConc.metricas.bestObjective ? "Secuencial" : "Concurrente");
+            System.out.println("Mejor solucion: " + mejor + " (menor costo)");
+            System.out.println("");
+            System.out.println("Nota: El 'costo' mide penalizaciones por envios sin asignar y atrasados.");
+            System.out.println("Un costo mas bajo significa una solucion mejor.");
+            System.out.println("==========================================");
+        } else {
+            System.out.println("(Ejecución en modo secuencial-only, versión concurrente omitida)");
+        }
 
         // Exportar CSVs
         exportarCSVs(resSeq, "secuencial");

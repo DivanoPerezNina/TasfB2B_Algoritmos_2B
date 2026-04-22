@@ -23,9 +23,24 @@ public class PlanificadorALNSConcurrente {
             long seedHilo = config.seed + i;
             completionService.submit(() -> {
                 ConfigExperimentacion configHilo = new ConfigExperimentacion(new String[]{});
+                configHilo.pathAeropuertos = config.pathAeropuertos;
+                configHilo.pathVuelos = config.pathVuelos;
+                configHilo.pathEnviosDir = config.pathEnviosDir;
+                configHilo.maxEnvios = config.maxEnvios;
                 configHilo.iteraciones = iterPorHilo;
+                configHilo.threads = config.threads;
                 configHilo.seed = seedHilo;
-                // Copiar otros
+                configHilo.temperaturaInicial = config.temperaturaInicial;
+                configHilo.coolingRate = config.coolingRate;
+                configHilo.maxSaltos = config.maxSaltos;
+                configHilo.tiempoMinEscalaMin = config.tiempoMinEscalaMin;
+                configHilo.pesoUnassigned = config.pesoUnassigned;
+                configHilo.pesoLateRequests = config.pesoLateRequests;
+                configHilo.pesoLateBags = config.pesoLateBags;
+                configHilo.pesoTotalLateness = config.pesoTotalLateness;
+                configHilo.pesoTotalHops = config.pesoTotalHops;
+                configHilo.pesoStorageOveruse = config.pesoStorageOveruse;
+
                 PlanificadorALNS planner = new PlanificadorALNS(datos, configHilo);
                 return planner.ejecutar(new SolucionALNS(solucionInicial));
             });
