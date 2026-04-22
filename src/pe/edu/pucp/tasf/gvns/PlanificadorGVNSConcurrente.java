@@ -107,6 +107,8 @@ public class PlanificadorGVNSConcurrente {
 
             int[]  rutaTemp = new int [MAX_SALTOS];
             long[] diasTemp = new long[MAX_SALTOS];
+            Arrays.fill(rutaTemp, -1);    // Java default=0; 0 es un ID de vuelo válido → usar -1
+            Arrays.fill(diasTemp, -1L);
 
             // ── GREEDY ITERATIVO (no DFS) ─────────────────────────────────────
             boolean encontroRuta = buscarRutaGreedy(
