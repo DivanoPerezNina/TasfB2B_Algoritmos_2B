@@ -1,10 +1,10 @@
-javac -cp src src/pe/edu/pucp/tasf/*.java
+javac -cp src src/pe/edu/pucp/tasf/alns/*.java
 
 1000
-java -cp src pe.edu.pucp.tasf.MainALNS --maxEnvios=1000 --iteraciones=10
+java -cp src pe.edu.pucp.tasf.alns.MainALNS --maxEnvios=1000 --iteraciones=10
 
 10k
-java -cp src pe.edu.pucp.tasf.MainALNS --maxEnvios=10000 --iteraciones=50
+java -cp src pe.edu.pucp.tasf.alns.MainALNS --maxEnvios=10000 --iteraciones=50
 
 9.5M
-java -Xmx10G -cp src pe.edu.pucp.tasf.MainALNS --iteraciones=2000
+java -Xmx10G -cp src pe.edu.pucp.tasf.alns.MainALNS --iteraciones=2000
