@@ -1,5 +1,4 @@
-package pe.edu.pucp.tasf;
-
+package pe.edu.pucp.tasf.alns;
 /**
  * Métricas calculadas para una solución.
  */

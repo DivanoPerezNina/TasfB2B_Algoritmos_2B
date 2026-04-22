@@ -1,5 +1,4 @@
-package pe.edu.pucp.tasf;
-
+package pe.edu.pucp.tasf.alns;
 import java.util.List;
 import java.util.Random;
 

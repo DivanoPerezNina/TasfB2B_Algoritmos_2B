@@ -1,5 +1,4 @@
-package pe.edu.pucp.tasf;
-
+package pe.edu.pucp.tasf.alns;
 import java.io.*;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;

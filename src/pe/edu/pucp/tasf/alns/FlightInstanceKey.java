@@ -1,5 +1,4 @@
-package pe.edu.pucp.tasf;
-
+package pe.edu.pucp.tasf.alns;
 /**
  * Clave para identificar instancia de vuelo.
  */
