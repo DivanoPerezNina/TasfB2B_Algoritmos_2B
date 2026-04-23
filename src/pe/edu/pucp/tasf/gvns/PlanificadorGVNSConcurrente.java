@@ -3,79 +3,144 @@ package pe.edu.pucp.tasf.gvns;
 import java.io.FileWriter;
 import java.io.PrintWriter;
 import java.util.Arrays;
+import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
 
 /**
- * Implementación del algoritmo GVNS para el problema SPMCF-TW.
+ * Planificador GVNS Concurrente — Iteración 3
  *
- * <p>Referencia: Polat, Kalayci &amp; Topaloglu (2026). "A General Variable
- * Neighborhood Search for Single-Path Unsplittable Multicommodity Network
- * Flow with Time Windows." <em>Soft Computing</em> 30, 327-352.</p>
+ * Basado en: Polat, Kalayci &amp; Topaloglu (2026). Soft Computing 30, 327-352.
+ * "An enhanced variable neighborhood search algorithm for rich multi-compartment
+ * vehicle routing problems."
  *
- * <p>El algoritmo opera en dos fases:</p>
- * <ul>
- *   <li><b>Fase 2 — Construcción inicial:</b> para cada envío, escanea TODOS
- *       los vuelos en los tres niveles (directo / 1 escala / 2 escalas) y
- *       selecciona la ruta con mínima llegada absoluta (mínimo tránsito).
- *       Equivale a la heurística constructiva del §3.3 de Polat et al.</li>
- *   <li><b>Fase 3 — Mejora GVNS:</b> ciclo {@code while (t < t_max)} con
- *       Shaking (eyección aleatoria de k×batch envíos), VND N1 (re-ruteo
- *       con mínimo tránsito) y VND N2 (DFS para no-ruteados + reducción de
- *       escalas). Criterio de aceptación: f(x') &lt; f(x).</li>
- * </ul>
+ * Adaptación al problema de rutas de equipaje en redes de vuelos (Single-Path
+ * Unsplittable Multicommodity Network Flow with Time Windows):
+ *   - "Vehículo"    → Vuelo con capacidad de maletas.
+ *   - "Cliente"     → Envío (origen, destino, maletas, ventana de tiempo).
+ *   - "Ruta"        → Secuencia de vuelos (máximo MAX_SALTOS tramos).
  *
- * <p><b>Función objetivo:</b> {@code f(x) = Σ (llegadaUTC[e] − registroUTC[e])}
- * para todos los envíos ruteados. Minimizar = vuelos más directos y tempranos.</p>
+ * ── ESTRUCTURA DEL ALGORITMO (Polat et al. §3.2) ────────────────────────────
+ *  Fase 2 — Solución inicial (§3.4):
+ *    1. Permutación aleatoria de los envíos (Fisher-Yates con semilla fija).
+ *    2. Para cada envío en ese orden: asignar la primera ruta factible
+ *       encontrada por búsqueda greedy de 3 niveles (directo / 1 escala /
+ *       2 escalas). Los no asignados van al pool de rechazados.
+ *  Fase 3 — Mejora GVNS (§3.2):
+ *    Loop hasta tiempo límite o f(x)=0:
+ *      · Shaking:     expulsar k*batch envíos asignados → pool de rechazados.
+ *      · VND N1:      intentar re-insertar rechazados vía DFS (Relocate).
+ *      · VND N2:      liberar un vuelo temporalmente y re-insertar (Exchange).
+ *      · Aceptación:  si mejora, k=1; si no, k=(k%K_MAX)+1 y se revierte.
  *
- * <p><b>Restricciones de implementación:</b></p>
- * <ul>
- *   <li>Arrays primitivos {@code int[]}, {@code long[]} — sin boxing a 9.5 M de escala.</li>
- *   <li>{@code ConcurrentHashMap<Long,AtomicInteger>} + CAS loop — control de
- *       capacidad lock-free bajo parallel streams.</li>
- *   <li>Shaking es secuencial (necesita snapshot atómico de la solución);
- *       VND N1/N2 usan {@code IntStream.parallel()} para máximo throughput.</li>
- * </ul>
+ * ── RESTRICCIONES ARQUITECTÓNICAS NO NEGOCIABLES ────────────────────────────
+ *   - Arrays primitivos int[], long[] para datos masivos (sin ArrayList<Object>).
+ *   - ConcurrentHashMap<Long, AtomicInteger> + CAS loop (lock-free, sin mutex).
+ *   - Parallel streams en Fase 2 y VND; Shaking secuencial (requiere snapshot).
  */
 public class PlanificadorGVNSConcurrente {
 
+    // ── DATOS DEL PROBLEMA ───────────────────────────────────────────────────
+    /** Red de vuelos y envíos cargados por GestorDatos. */
     private GestorDatos tablero;
+
+    /**
+     * solucionVuelos[e][s] = índice del vuelo en el tramo s del envío e.
+     * -1 indica que el tramo no existe (envío directo usa solo s=0).
+     */
     public int[][]  solucionVuelos;
+
+    /**
+     * solucionDias[e][s] = minuto UTC absoluto de salida del tramo s del envío e.
+     * Permite reconstruir la cadena temporal de la ruta sin recalcular.
+     */
     public long[][] solucionDias;
 
-    // --- POOL DE RECHAZADOS ---
+    // ── POOL DE RECHAZADOS ───────────────────────────────────────────────────
+    /**
+     * Envíos que no encontraron ruta factible en Fase 2 (o expulsados en Shaking).
+     * La Fase 3 (VND N1/N2) intentará re-insertarlos.
+     * Entradas marcadas -1 = ya salvados (espacios reutilizables).
+     */
     public int[] enviosRechazados = new int[500_000];
+    /** Número de posiciones ocupadas en enviosRechazados[] (incluye los -1). */
     public int   totalRechazados  = 0;
 
-    // --- PARÁMETROS DE NEGOCIO ---
+    // ── PARÁMETROS DE NEGOCIO ────────────────────────────────────────────────
+    /** Tiempo mínimo de escala entre dos vuelos consecutivos (minutos). */
     public final int TIEMPO_MINIMO_ESCALA = 10;
+    /** Máximo de tramos por ruta. 3 = directo, 1 escala o 2 escalas. */
     public final int MAX_SALTOS           = 3;
 
-    // --- PARÁMETROS GVNS (Polat et al., 2026 — Tabla 3) ---
+    // ── PARÁMETROS GVNS (Polat et al. 2026, Tabla 3) ─────────────────────────
+    /** Tiempo de CPU máximo para la Fase 3 (ms). */
     private static final long TIEMPO_LIMITE_MS = 120_000L;
+    /** Número máximo de estructuras de vecindad (k_max en el paper). */
     private static final int  K_MAX            = 3;
+    /** Envíos expulsados por iteración de Shaking en k=1 (escala con k). */
     private static final int  BATCH_FACTOR     = 20;
 
-    // --- SINCRONIZACIÓN ---
+    // ── ALEATORIEDAD — FASE 2 (Polat et al. §3.4) ────────────────────────────
+    /**
+     * Semilla para el generador de números aleatorios.
+     * Determina el orden de procesamiento de envíos en la Fase 2.
+     * Semilla fija → resultados reproducibles entre ejecuciones.
+     */
+    private final long   semilla;
+    /**
+     * Generador de números aleatorios seeded para la permutación inicial.
+     * Solo se usa en construirSolucionInicial() (hilo principal, sin concurrencia).
+     */
+    private final Random rng;
+
+    // ── SINCRONIZACIÓN ───────────────────────────────────────────────────────
+    /** Mutex para escrituras en el pool de rechazados (escritura rara). */
     private final Object lockRechazados = new Object();
+    /** Contador atómico de envíos con ruta asignada (Fase 2 + Fase 3). */
     public  AtomicInteger enviosExitosos = new AtomicInteger(0);
+    /**
+     * Mapa de ocupación de vuelos.
+     * Clave: claveVueloDia(v, salidaAbsoluta) → vuelo v en el día de salidaAbsoluta.
+     * Valor: maletas actualmente reservadas en ese vuelo-día.
+     * Acceso lock-free mediante CAS (compareAndSet) en intentarReservarEspacio().
+     */
     public  ConcurrentHashMap<Long, AtomicInteger> ocupacionVuelos = new ConcurrentHashMap<>();
 
-    // --- MUESTRAS PARA ExportadorVisual ---
-    /** Primeros 100 envíos ruteados exitosamente en Fase 2. */
-    public final int[]        muestraFase2    = new int[100];
+    // ── MUESTRAS PARA ExportadorVisual ───────────────────────────────────────
+    /** Primeros 100 envíos ruteados exitosamente en Fase 2 (para JSON de muestra). */
+    public final int[]          muestraFase2    = new int[100];
     private final AtomicInteger idxMuestraFase2 = new AtomicInteger(0);
 
-    /** Primeros 10 envíos salvados por la Fase 3 (GVNS). */
-    public final int[]        muestraGVNS     = new int[10];
+    /** Primeros 10 envíos salvados por la Fase 3 GVNS (para JSON de muestra). */
+    public final int[]          muestraGVNS     = new int[10];
     private final AtomicInteger idxMuestraGVNS  = new AtomicInteger(0);
 
     // =========================================================================
-    // CONSTRUCTOR
+    // CONSTRUCTORES
     // =========================================================================
+
+    /**
+     * Constructor con semilla por defecto (12345).
+     * Equivalente a {@code new PlanificadorGVNSConcurrente(datos, 12345L)}.
+     */
     public PlanificadorGVNSConcurrente(GestorDatos datos) {
+        this(datos, 12345L);
+    }
+
+    /**
+     * Constructor principal.
+     *
+     * @param datos   Red de vuelos y envíos ya cargada por GestorDatos.
+     * @param semilla Semilla para la permutación aleatoria de la Fase 2 (§3.4).
+     *                Misma semilla → mismo orden de procesamiento → resultados reproducibles.
+     */
+    public PlanificadorGVNSConcurrente(GestorDatos datos, long semilla) {
         this.tablero        = datos;
+        this.semilla        = semilla;
+        this.rng            = new Random(semilla);
+
+        // Matrices de solución: -1 = tramo sin asignar
         this.solucionVuelos = new int [datos.numEnvios][MAX_SALTOS];
         this.solucionDias   = new long[datos.numEnvios][MAX_SALTOS];
 
@@ -91,55 +156,95 @@ public class PlanificadorGVNSConcurrente {
     // =========================================================================
     // ACCESORES DE MUESTRA (para ExportadorVisual)
     // =========================================================================
+
+    /** Número de envíos capturados en muestraFase2[] (máximo 100). */
     public int cantMuestraFase2() { return Math.min(idxMuestraFase2.get(), 100); }
+
+    /** Número de envíos capturados en muestraGVNS[] (máximo 10). */
     public int cantMuestraGVNS()  { return Math.min(idxMuestraGVNS.get(),  10); }
 
     // =========================================================================
-    // FASE 2: CONSTRUCCIÓN DE SOLUCIÓN INICIAL — §3.3 Polat et al. (2026)
+    // FASE 2: CONSTRUCCIÓN DE LA SOLUCIÓN INICIAL — Polat et al. (2026) §3.4
     //
-    // Para cada envío se invoca buscarMejorRuta(), que escanea TODOS los vuelos
-    // en los tres niveles (directo / 1 escala / 2 escalas) y conserva la opción
-    // con menor llegada absoluta (mínimo tránsito). La diferencia clave con un
-    // greedy "primer hallazgo" es que aquí nunca se acepta el primer vuelo
-    // disponible: se recorre el espacio completo antes de decidir.
+    // El paper establece un proceso de 3 pasos:
+    //   PASO 1: "the sequence of orders is established through a random generation"
+    //           → Permutación aleatoria de los índices de envío (Fisher-Yates).
+    //   PASO 2: "this random sequence serves as the basis for determining the
+    //            specific customers to be visited"
+    //           → Iterar sobre la permutación para determinar qué envíos procesar.
+    //   PASO 3: "the final step involves the allocation of vehicles to designated tours"
+    //           → Para cada envío en orden aleatorio: asignar la primera ruta
+    //             factible hallada por búsqueda greedy de 3 niveles.
     //
-    // Complejidad por envío:
-    //   Nivel 1: O(V)       — scan de vuelos directos
-    //   Nivel 2: O(V²)      — scan de pares (v1, v2)
-    //   Nivel 3: O(V³) pod. — solo si niveles 1 y 2 no encuentran nada
-    // Se paraleliza sobre los N envíos con IntStream.parallel().
+    // La búsqueda greedy (buscarRutaGreedy) es equivalente al "allocation of
+    // vehicles to tours": evalúa vuelo directo → 1 escala → 2 escalas y reserva
+    // capacidad atómicamente (CAS). Envíos sin ruta van al pool de rechazados
+    // (análogos a "placeholder vehicles incurring penalties" del paper).
+    //
+    // El orden aleatorio es la diferencia fundamental respecto a la versión
+    // anterior (greedy secuencial 0..N-1). Con capacidad limitada, el orden de
+    // procesamiento determina qué envíos "ganan" los asientos disponibles.
+    // La aleatoriedad evita el sesgo sistemático por ID de envío.
+    //
+    // Complejidad por envío: O(V) directo / O(V²) 1 escala / O(V³) 2 escalas.
+    // El DFS recursivo (exploración completa) se reserva para la Fase 3.
     // =========================================================================
 
     /**
-     * Construye la solución inicial asignando a cada envío la ruta de
-     * mínimo tiempo de tránsito disponible (§3.3 Polat et al., 2026).
+     * Construye la solución inicial asignando rutas a todos los envíos.
      *
-     * <p>Ejecuta en paralelo sobre todos los envíos. La reserva de
-     * capacidad es lock-free mediante CAS sobre AtomicInteger.</p>
+     * <p>Sigue el proceso descrito en Polat et al. (2026) §3.4:
+     * <ol>
+     *   <li>Genera una permutación aleatoria de los índices de envío.</li>
+     *   <li>Procesa cada envío en ese orden aleatorio (en paralelo).</li>
+     *   <li>Asigna la primera ruta factible (directo / 1 escala / 2 escalas).</li>
+     *   <li>Envíos sin ruta quedan en el pool de rechazados para la Fase 3.</li>
+     * </ol>
      */
     public void construirSolucionInicial() {
-        System.out.println("Fase 2: Construccion Inicial — Minimo Transito (Polat et al., 2026)...");
+        System.out.printf("Fase 2: Construccion Inicial Aleatoria + Greedy (semilla=%d, multihilo)...%n",
+                semilla);
 
-        IntStream.range(0, tablero.numEnvios).parallel().forEach(e -> {
+        // PASO 1 (§3.4): Permutación aleatoria de pedidos.
+        // "the sequence of orders is established through a random generation,
+        //  taking into account the aggregate number of orders to be fulfilled."
+        // La semilla fija garantiza reproducibilidad entre ejecuciones.
+        int[] permutacion = generarPermutacionAleatoria(tablero.numEnvios);
+
+        // PASO 2-3 (§3.4): Procesar envíos en el orden aleatorio y asignar rutas.
+        // Cada hilo accede a permutacion[idx] para obtener el índice real del envío.
+        // La escritura en solucionVuelos[e] y solucionDias[e] es segura porque
+        // cada índice 'e' es único (no hay dos hilos escribiendo en la misma fila).
+        IntStream.range(0, tablero.numEnvios).parallel().forEach(idx -> {
+            int e = permutacion[idx]; // índice real del envío en orden aleatorio
+
+            int  origen    = tablero.envioOrigen[e];
+            int  destino   = tablero.envioDestino[e];
+            int  maletas   = tablero.envioMaletas[e];
+            long tRegistro = tablero.envioRegistroUTC[e];
+            long deadline  = tablero.envioDeadlineUTC[e];
+
             int[]  rutaTemp = new int [MAX_SALTOS];
             long[] diasTemp = new long[MAX_SALTOS];
-            Arrays.fill(rutaTemp, -1);    // Java default=0; vuelo 0 es válido → explícito -1
-            Arrays.fill(diasTemp, -1L);
 
-            // Scan completo: elige la ruta con menor llegada absoluta en los 3 niveles
-            boolean encontroRuta = buscarMejorRuta(e, rutaTemp, diasTemp) < Long.MAX_VALUE;
+            // Buscar y reservar la primera ruta factible (greedy, sin backtracking).
+            boolean encontroRuta = buscarRutaGreedy(
+                    origen, destino, maletas, tRegistro, deadline, rutaTemp, diasTemp);
 
             if (encontroRuta) {
-                // Escritura segura: cada hilo escribe en su propio índice 'e'
+                // Escritura segura: cada hilo escribe exclusivamente en su índice 'e'.
                 System.arraycopy(rutaTemp, 0, solucionVuelos[e], 0, MAX_SALTOS);
                 System.arraycopy(diasTemp, 0, solucionDias[e],   0, MAX_SALTOS);
                 enviosExitosos.incrementAndGet();
 
-                // Capturar muestra para ExportadorVisual (primeros 100)
-                int idx = idxMuestraFase2.getAndIncrement();
-                if (idx < 100) muestraFase2[idx] = e;
+                // Guardar en muestra para ExportadorVisual (primeros 100 exitosos).
+                int mi = idxMuestraFase2.getAndIncrement();
+                if (mi < 100) muestraFase2[mi] = e;
 
             } else {
+                // Sin ruta: va al pool de rechazados (Fase 3 intentará reasignarlos).
+                // "tours are temporarily assigned to placeholder vehicles,
+                //  a practice that incurs penalties" — paper §3.4.
                 synchronized (lockRechazados) {
                     if (totalRechazados < enviosRechazados.length)
                         enviosRechazados[totalRechazados++] = e;
@@ -151,20 +256,75 @@ public class PlanificadorGVNSConcurrente {
                 enviosExitosos.get(), tablero.numEnvios, totalRechazados);
     }
 
+    /**
+     * Genera una permutación aleatoria de [0, n) usando el algoritmo Fisher-Yates.
+     *
+     * <p>El algoritmo garantiza que todas las n! permutaciones posibles son
+     * equiprobables. La semilla del campo {@code rng} hace la permutación
+     * determinista: misma semilla → mismo orden.
+     *
+     * <p>Referencia: Polat et al. (2026) §3.4 — "the sequence of orders is
+     * established through a random generation".
+     *
+     * @param n número de elementos (= número de envíos).
+     * @return array de longitud n con los índices 0..n-1 en orden aleatorio.
+     */
+    private int[] generarPermutacionAleatoria(int n) {
+        int[] perm = new int[n];
+        for (int i = 0; i < n; i++) perm[i] = i;
+
+        // Fisher-Yates shuffle: recorre de derecha a izquierda e intercambia
+        // cada posición con una posición aleatoria anterior (o igual).
+        for (int i = n - 1; i > 0; i--) {
+            int j = rng.nextInt(i + 1); // 0 <= j <= i
+            int tmp = perm[i];
+            perm[i] = perm[j];
+            perm[j] = tmp;
+        }
+        return perm;
+    }
+
     // =========================================================================
-    // BÚSQUEDA GOLOSA "PRIMER HALLAZGO" — FALLBACK INTERNO
+    // BÚSQUEDA GREEDY ITERATIVA — 3 NIVELES (FASE 2)
     //
-    // Usado únicamente como fallback dentro de buscarMejorRuta() cuando la
-    // reserva atómica de la mejor ruta falla por contención de capacidad.
+    // Asigna al envío la primera ruta factible encontrada, evaluando vuelos
+    // en el orden en que aparecen en el array tablero.vueloOrigen[].
     //
-    // Política de reserva:
-    //   Nivel 1: reservar v1 → éxito o próximo v1.
-    //   Nivel 2: reservar v1, luego iterar v2; liberar v1 si ningún v2 funciona.
-    //   Nivel 3: análogo con 3 vuelos, libera en cascada al fallar.
+    // La "greedy" aquí significa: primer vuelo que cabe, no el más barato.
+    // Esta decisión es intencional: en la Fase 2 se busca velocidad (O(V³)
+    // sin backtracking). La calidad de la solución se mejora en la Fase 3.
     //
-    // Toma el PRIMER vuelo válido (no el de mínimo tránsito). No usarse
-    // directamente en Fase 2; para eso existe buscarMejorRuta().
+    // Política de reserva de capacidad (lock-free):
+    //   Nivel 1: intentar reservar v1 → si ok, éxito; si no, probar siguiente v1.
+    //   Nivel 2: reservar v1, luego iterar v2; si ningún v2 cabe → liberar v1.
+    //   Nivel 3: reservar v1, reservar v2, iterar v3; libera en cascada al fallar.
+    //
+    // Si ningún nivel encuentra ruta → el envío queda rechazado (Fase 3).
     // =========================================================================
+
+    /**
+     * Busca y reserva la primera ruta factible para un envío.
+     *
+     * <p>Evalúa tres niveles en orden:
+     * <ol>
+     *   <li><b>Nivel 1</b> — Vuelo directo: origen → destino (1 tramo).</li>
+     *   <li><b>Nivel 2</b> — 1 escala: origen → escala → destino (2 tramos).</li>
+     *   <li><b>Nivel 3</b> — 2 escalas: origen → e1 → e2 → destino (3 tramos).</li>
+     * </ol>
+     *
+     * <p>En cada nivel, la capacidad se reserva atómicamente (CAS). Si un
+     * vuelo intermedio no puede ser completado, su espacio se libera antes
+     * de intentar la siguiente combinación.
+     *
+     * @param origen    ID del aeropuerto de origen del envío.
+     * @param destino   ID del aeropuerto de destino del envío.
+     * @param maletas   Número de maletas del envío (demanda de capacidad).
+     * @param tRegistro Minuto UTC absoluto desde el que el envío está disponible.
+     * @param deadline  Minuto UTC absoluto límite de llegada al destino.
+     * @param rutaOut   Array de salida: índices de vuelo por tramo (se rellena si éxito).
+     * @param diasOut   Array de salida: minutos UTC absolutos de salida por tramo.
+     * @return {@code true} si se encontró y reservó una ruta factible.
+     */
     private boolean buscarRutaGreedy(int origen, int destino, int maletas,
                                      long tRegistro, long deadline,
                                      int[] rutaOut, long[] diasOut) {
@@ -284,15 +444,37 @@ public class PlanificadorGVNSConcurrente {
         return false; // Sin ruta en ninguno de los 3 niveles → envío rechazado
     }
 
-    /** Duración de vuelo en minutos, ajustada si cruza medianoche. */
+    /**
+     * Calcula la duración del vuelo v en minutos, corrigiendo si la llegada
+     * es al día siguiente (llegada UTC &lt; salida UTC → el vuelo cruza medianoche).
+     */
     private long duracionVuelo(int v) {
         long dur = tablero.vueloLlegadaUTC[v] - tablero.vueloSalidaUTC[v];
         return (dur < 0) ? dur + 1440 : dur;
     }
 
     // =========================================================================
-    // CONTROL DE CAPACIDAD ATÓMICO Y LOCK-FREE — SIN CAMBIOS
+    // CONTROL DE CAPACIDAD — LOCK-FREE CON CAS (Compare-And-Set)
+    //
+    // El mapa ocupacionVuelos asocia a cada vuelo-día el número de maletas
+    // ya reservadas. Las operaciones de reserva y liberación son atómicas:
+    // ningún hilo puede reservar más allá de la capacidad del vuelo.
+    //
+    // Se usa CAS en lugar de synchronized para evitar contención de mutex
+    // en escenarios con millones de envíos procesados en paralelo.
     // =========================================================================
+
+    /**
+     * Intenta reservar {@code maletas} asientos en el vuelo {@code v} para
+     * el día correspondiente a {@code salidaAbsoluta}.
+     *
+     * <p>Implementa un CAS loop: lee la ocupación actual, verifica que la
+     * suma no supere la capacidad, e intenta escribir atómicamente. Si otro
+     * hilo modifica el contador antes del CAS, reintenta.
+     *
+     * @return {@code true} si la reserva fue exitosa; {@code false} si no hay
+     *         capacidad disponible.
+     */
     private boolean intentarReservarEspacio(int v, long salidaAbsoluta, int maletas) {
         long key = claveVueloDia(v, salidaAbsoluta);
         ocupacionVuelos.putIfAbsent(key, new AtomicInteger(0));
@@ -301,22 +483,77 @@ public class PlanificadorGVNSConcurrente {
             int actual = ocu.get();
             if (actual + maletas > tablero.vueloCapacidad[v]) return false;
             if (ocu.compareAndSet(actual, actual + maletas))  return true;
+            // CAS falló: otro hilo modificó el contador; reintentar.
         }
     }
 
+    /**
+     * Libera {@code maletas} asientos previamente reservados en el vuelo {@code v}.
+     * Se llama cuando una ruta parcial no puede completarse (rollback de capacidad).
+     */
     private void liberarEspacio(int v, long salidaAbsoluta, int maletas) {
         AtomicInteger ocu = ocupacionVuelos.get(claveVueloDia(v, salidaAbsoluta));
         if (ocu != null) ocu.addAndGet(-maletas);
     }
 
-    /** Clave única vuelo-día para el mapa de ocupación. */
+    /**
+     * Genera la clave única para identificar un vuelo en un día específico.
+     *
+     * <p>Fórmula: {@code v * 100_000 + diaAbsoluto}, donde diaAbsoluto =
+     * salidaAbsoluta / 1440. Permite que el mismo vuelo (vuelo v) tenga
+     * ocupaciones distintas en días distintos (vuelo repetido en el schedule).
+     */
     private static long claveVueloDia(int v, long salidaAbsoluta) {
         return v * 100_000L + (salidaAbsoluta / 1440);
     }
 
+    /**
+     * Calcula el minuto UTC absoluto de salida del vuelo, dado el minuto actual.
+     *
+     * <p>Si el vuelo sale más tarde en el mismo día: usamos ese horario.
+     * Si el vuelo ya pasó hoy: usamos el horario del día siguiente (+1440 min).
+     * Esto modela vuelos con horario fijo que operan diariamente.
+     *
+     * @param minutoActualAbsoluto minuto UTC desde el que el envío está disponible.
+     * @param salidaVueloUTC       minuto del día UTC en que sale el vuelo (0-1439).
+     * @return minuto UTC absoluto de la próxima salida factible del vuelo.
+     */
+    private long calcularMinutoSalidaReal(long minutoActualAbsoluto, long salidaVueloUTC) {
+        long minDelDia  = minutoActualAbsoluto % 1440;
+        long diaAbs     = minutoActualAbsoluto / 1440;
+        return (minDelDia <= salidaVueloUTC)
+                ? diaAbs * 1440 + salidaVueloUTC
+                : (diaAbs + 1) * 1440 + salidaVueloUTC;
+    }
+
     // =========================================================================
     // MOTOR DFS — EXCLUSIVO PARA FASE 3 (VND N1/N2)
+    //
+    // A diferencia de buscarRutaGreedy(), este DFS explora TODAS las rutas
+    // posibles con backtracking. Es más lento (O(V^MAX_SALTOS) worst-case)
+    // pero encuentra rutas que el greedy pierde por no retroceder.
+    // Se usa en VND N1 (Relocate) y VND N2 (Exchange) donde la calidad de la
+    // exploración justifica el costo adicional por envío rechazado.
     // =========================================================================
+
+    /**
+     * Búsqueda en profundidad (DFS) con backtracking para encontrar una ruta
+     * desde {@code nodoActual} hasta {@code destinoFinal}.
+     *
+     * <p>Reserva capacidad en cada tramo; si la rama falla, libera y retrocede.
+     * Llama recursivamente incrementando {@code saltoActual} hasta alcanzar
+     * el destino o agotar {@code MAX_SALTOS}.
+     *
+     * @param nodoActual      aeropuerto desde el que se busca el siguiente vuelo.
+     * @param destinoFinal    aeropuerto objetivo.
+     * @param maletas         maletas a transportar (demanda de capacidad).
+     * @param tiempoActual    minuto UTC absoluto más temprano para la salida.
+     * @param deadline        minuto UTC absoluto límite de llegada.
+     * @param saltoActual     profundidad actual en la recursión (0-indexed).
+     * @param rutaTempVuelos  array de salida para índices de vuelo.
+     * @param rutaTempDias    array de salida para minutos UTC de salida.
+     * @return {@code true} si se encontró una ruta factible completa.
+     */
     private boolean buscarRutaDFS(int nodoActual, int destinoFinal, int maletas,
                                   long tiempoActual, long deadline, int saltoActual,
                                   int[] rutaTempVuelos, long[] rutaTempDias) {
@@ -346,309 +583,175 @@ public class PlanificadorGVNSConcurrente {
         return false;
     }
 
-    private long calcularMinutoSalidaReal(long minutoActualAbsoluto, long salidaVueloUTC) {
-        long minDelDia  = minutoActualAbsoluto % 1440;
-        long diaAbs     = minutoActualAbsoluto / 1440;
-        return (minDelDia <= salidaVueloUTC)
-                ? diaAbs * 1440 + salidaVueloUTC
-                : (diaAbs + 1) * 1440 + salidaVueloUTC;
+    // =========================================================================
+    // FASE 3: GVNS — CICLO METAHEURÍSTICO (Polat et al. 2026, §3.2)
+    //
+    // Estructura VNS estándar aplicada al problema de re-inserción de rechazados:
+    //   - Función objetivo f(x) = número de envíos en el pool de rechazados.
+    //   - Shaking:    expulsar k*BATCH envíos asignados → ampliar espacio de búsqueda.
+    //   - VND N1:     re-insertar rechazados con DFS (Relocate).
+    //   - VND N2:     liberar temporalmente un vuelo, re-insertar con DFS (Exchange).
+    //   - Aceptación: si f(x) mejora → k=1; si no → revertir y k = (k%K_MAX)+1.
+    // =========================================================================
+
+    /** Cuenta los envíos activamente rechazados (ignora posiciones -1 ya salvadas). */
+    private int contarRechazadosActivos() {
+        int count = 0;
+        for (int i = 0; i < totalRechazados; i++)
+            if (enviosRechazados[i] != -1) count++;
+        return count;
     }
 
-    // =========================================================================
-    // FASE 3: GVNS FORMAL — POLAT ET AL. (2026)
-    //
-    // ── CAMBIO CLAVE DE DISEÑO ───────────────────────────────────────────────
-    // ANTES: f(x) = envíos rechazados → siempre 0 si el greedy rutea todo.
-    // AHORA: f(x) = Σ (llegadaUTC[e] − registroUTC[e]) para todos los envíos.
-    //
-    // La Fase 2 garantiza factibilidad al 100 %. El GVNS mejora la CALIDAD:
-    // vuelos directos más tempranos, escalas más cortas, menor tiempo de espera.
-    //
-    // Estructura §3.4–§3.6 Polat et al.:
-    //   while (t < t_max)
-    //     Shaking:  ejectar k×batch envíos RUTEADOS → liberar su capacidad
-    //     VND N1:   re-rutear con scan completo → mínima llegada absoluta
-    //     VND N2:   DFS para los no re-ruteados; reducir saltos para los multi-hop
-    //     Criterio: f(x') < f(x) → aceptar + k=1 | rollback + k++
-    // =========================================================================
-
-    // ── f(x): tiempo total de tránsito en minutos ─────────────────────────────
-    public long calcularTransitoTotal() {
-        long total = 0;
-        for (int e = 0; e < tablero.numEnvios; e++) {
-            if (solucionVuelos[e][0] == -1) continue;
-            int lastS = 0;
-            for (int s = 1; s < MAX_SALTOS; s++)
-                if (solucionVuelos[e][s] != -1) lastS = s;
-            long llegada = solucionDias[e][lastS] + duracionVuelo(solucionVuelos[e][lastS]);
-            total += llegada - tablero.envioRegistroUTC[e];
+    /** Marca el envío {@code idEnvio} como salvado en el pool (pone -1 en su posición). */
+    private void eliminarDeRechazados(int idEnvio) {
+        for (int i = 0; i < totalRechazados; i++) {
+            if (enviosRechazados[i] == idEnvio) { enviosRechazados[i] = -1; return; }
         }
-        return total;
     }
 
-    // ── Índice del último tramo activo en una ruta ────────────────────────────
-    private int ultimoSalto(int[] ruta) {
-        int last = 0;
-        for (int s = 1; s < MAX_SALTOS; s++) if (ruta[s] != -1) last = s;
-        return last;
-    }
-
-    // ── Reserva atómica de toda una ruta con rollback completo ────────────────
-    private boolean reservarRuta(int[] ruta, long[] dias, int maletas) {
-        int ok = 0;
-        for (int s = 0; s < MAX_SALTOS; s++) {
-            if (ruta[s] == -1) break;
-            if (!intentarReservarEspacio(ruta[s], dias[s], maletas)) {
-                for (int r = 0; r < ok; r++) liberarEspacio(ruta[r], dias[r], maletas);
-                return false;
-            }
-            ok++;
-        }
-        return ok > 0;
-    }
-
-    // =========================================================================
-    // BÚSQUEDA DE MÍNIMO TRÁNSITO — núcleo de Fase 2 y VND N1
-    //
-    // Escanea TODOS los vuelos en los tres niveles (directo / 1 escala /
-    // 2 escalas) y conserva la combinación con llegada absoluta más temprana.
-    // Las rutas de nivel 2 solo se exploran si mejoran el mejor nivel 1 ya
-    // encontrado (poda por cota superior: lle1 >= bestLle). Las de nivel 3
-    // solo se exploran si niveles 1 y 2 no encontraron ninguna ruta.
-    //
-    // Reserva capacidad solo al final (una sola reserva atómica sobre la
-    // mejor ruta). Si la reserva falla por contención concurrente, recae
-    // en buscarRutaGreedy() como fallback.
-    //
-    // Retorna tiempo de tránsito (llegadaFinal − registroUTC) en minutos,
-    // o Long.MAX_VALUE si no existe ninguna ruta factible.
-    // =========================================================================
-    private long buscarMejorRuta(int e, int[] rutaOut, long[] diasOut) {
-        int  ori  = tablero.envioOrigen[e],  des = tablero.envioDestino[e];
-        int  mal  = tablero.envioMaletas[e];
-        long tReg = tablero.envioRegistroUTC[e], dl = tablero.envioDeadlineUTC[e];
-
-        long bestLle = Long.MAX_VALUE;
-        int[]  bestR = {-1, -1, -1};
-        long[] bestD = {-1L, -1L, -1L};
-
-        // ── Nivel 1: vuelo directo ────────────────────────────────────────────
-        for (int v = 0; v < tablero.numVuelos; v++) {
-            if (tablero.vueloOrigen[v] != ori || tablero.vueloDestino[v] != des) continue;
-            long sal = calcularMinutoSalidaReal(tReg, tablero.vueloSalidaUTC[v]);
-            long lle = sal + duracionVuelo(v);
-            if (lle + TIEMPO_MINIMO_ESCALA > dl) continue;
-            if (lle < bestLle) {
-                bestLle = lle;
-                bestR[0] = v;   bestR[1] = -1;  bestR[2] = -1;
-                bestD[0] = sal; bestD[1] = -1L; bestD[2] = -1L;
-            }
-        }
-
-        // ── Nivel 2: 1 escala (poda: v1 ya llega tarde no puede mejorar) ─────
-        for (int v1 = 0; v1 < tablero.numVuelos; v1++) {
-            if (tablero.vueloOrigen[v1] != ori) continue;
-            int e1 = tablero.vueloDestino[v1];
-            if (e1 == des || e1 == ori) continue;
-            long sal1 = calcularMinutoSalidaReal(tReg, tablero.vueloSalidaUTC[v1]);
-            long lle1 = sal1 + duracionVuelo(v1);
-            if (lle1 + TIEMPO_MINIMO_ESCALA > dl || lle1 >= bestLle) continue;
-
-            for (int v2 = 0; v2 < tablero.numVuelos; v2++) {
-                if (tablero.vueloOrigen[v2] != e1 || tablero.vueloDestino[v2] != des) continue;
-                long sal2 = calcularMinutoSalidaReal(lle1, tablero.vueloSalidaUTC[v2]);
-                if (sal2 < lle1 + TIEMPO_MINIMO_ESCALA) sal2 += 1440;
-                long lle2 = sal2 + duracionVuelo(v2);
-                if (lle2 + TIEMPO_MINIMO_ESCALA > dl) continue;
-                if (lle2 < bestLle) {
-                    bestLle = lle2;
-                    bestR[0] = v1;  bestR[1] = v2;  bestR[2] = -1;
-                    bestD[0] = sal1; bestD[1] = sal2; bestD[2] = -1L;
-                }
-            }
-        }
-
-        // ── Nivel 3: 2 escalas (solo si niveles 1 y 2 no encontraron nada) ───
-        if (bestR[0] == -1) {
-            outer3:
-            for (int v1 = 0; v1 < tablero.numVuelos; v1++) {
-                if (tablero.vueloOrigen[v1] != ori) continue;
-                int e1 = tablero.vueloDestino[v1];
-                if (e1 == des || e1 == ori) continue;
-                long sal1 = calcularMinutoSalidaReal(tReg, tablero.vueloSalidaUTC[v1]);
-                long lle1 = sal1 + duracionVuelo(v1);
-                if (lle1 + TIEMPO_MINIMO_ESCALA > dl) continue;
-
-                for (int v2 = 0; v2 < tablero.numVuelos; v2++) {
-                    if (tablero.vueloOrigen[v2] != e1) continue;
-                    int e2 = tablero.vueloDestino[v2];
-                    if (e2 == des || e2 == ori || e2 == e1) continue;
-                    long sal2 = calcularMinutoSalidaReal(lle1, tablero.vueloSalidaUTC[v2]);
-                    if (sal2 < lle1 + TIEMPO_MINIMO_ESCALA) sal2 += 1440;
-                    long lle2 = sal2 + duracionVuelo(v2);
-                    if (lle2 + TIEMPO_MINIMO_ESCALA > dl) continue;
-
-                    for (int v3 = 0; v3 < tablero.numVuelos; v3++) {
-                        if (tablero.vueloOrigen[v3] != e2 || tablero.vueloDestino[v3] != des) continue;
-                        long sal3 = calcularMinutoSalidaReal(lle2, tablero.vueloSalidaUTC[v3]);
-                        if (sal3 < lle2 + TIEMPO_MINIMO_ESCALA) sal3 += 1440;
-                        long lle3 = sal3 + duracionVuelo(v3);
-                        if (lle3 + TIEMPO_MINIMO_ESCALA > dl) continue;
-                        if (lle3 < bestLle) {
-                            bestLle = lle3;
-                            bestR[0] = v1; bestR[1] = v2;  bestR[2] = v3;
-                            bestD[0] = sal1; bestD[1] = sal2; bestD[2] = sal3;
-                            break outer3; // primera ruta de 3 tramos válida
-                        }
-                    }
-                }
-            }
-        }
-
-        if (bestR[0] == -1) return Long.MAX_VALUE;
-
-        // Intentar reservar la mejor ruta (una sola reserva atómica)
-        if (!reservarRuta(bestR, bestD, mal)) {
-            // Fallback: primer vuelo válido disponible
-            Arrays.fill(rutaOut, -1); Arrays.fill(diasOut, -1L);
-            if (!buscarRutaGreedy(ori, des, mal, tReg, dl, rutaOut, diasOut))
-                return Long.MAX_VALUE;
-            int ls = ultimoSalto(rutaOut);
-            return (diasOut[ls] + duracionVuelo(rutaOut[ls])) - tReg;
-        }
-
-        System.arraycopy(bestR, 0, rutaOut, 0, MAX_SALTOS);
-        System.arraycopy(bestD, 0, diasOut, 0, MAX_SALTOS);
-        return bestLle - tReg;
-    }
-
-    // =========================================================================
-    // GVNS PRINCIPAL — Polat et al. (2026) §3.4
-    // =========================================================================
+    /**
+     * Ejecuta el ciclo de mejora GVNS sobre el pool de rechazados de la Fase 2.
+     *
+     * <p>Implementa el pseudocódigo de Polat et al. (2026) Fig. 2:
+     * <pre>
+     *   k ← 1
+     *   while tiempo_disponible AND f(x) &gt; 0:
+     *     x' ← Shaking(x, k)        // perturbar solución actual
+     *     x'' ← VND(x')             // búsqueda de descenso variable
+     *     if f(x'') &lt; f(x):         // criterio de aceptación
+     *       x ← x''; k ← 1
+     *     else:
+     *       revertir; k ← (k % K_MAX) + 1
+     * </pre>
+     *
+     * @return número total de envíos salvados (rechazados que recibieron ruta).
+     */
     public int ejecutarMejoraGVNS() {
         System.out.println("GVNS FORMAL: Iniciando ciclo metaheuristico (Polat et al., 2026)...");
 
-        long tiempoInicio  = System.currentTimeMillis();
-        long tiempoLimite  = tiempoInicio + TIEMPO_LIMITE_MS;
+        long tiempoInicio = System.currentTimeMillis();
+        long tiempoLimite = tiempoInicio + TIEMPO_LIMITE_MS;
 
-        int  k             = 1;
-        long mejorTransito = calcularTransitoTotal();
-        int  iterTotal     = 0;
-        int  mejorasAcum   = 0;
-        // Batch pequeño: VND N1 es O(V²) por shipment; con 20 shipments la iteración
-        // tarda ~ms, permitiendo miles de iteraciones en 120 s.
-        int  batchBase     = BATCH_FACTOR;
+        int k             = 1;
+        int mejorFitness  = contarRechazadosActivos();
+        int totalSalvados = 0;
+        int iterTotal     = 0;
+        int batchBase     = Math.max(BATCH_FACTOR, mejorFitness / 100);
 
-        System.out.printf("  Estado inicial: f(x)=%,d min | t_max=%ds | k_max=%d | batch=%d%n",
-                mejorTransito, TIEMPO_LIMITE_MS / 1000, K_MAX, batchBase);
+        System.out.printf("  Estado inicial: f(x)=%d | t_max=%ds | k_max=%d | batch=%d%n",
+                mejorFitness, TIEMPO_LIMITE_MS / 1000, K_MAX, batchBase);
 
-        while (System.currentTimeMillis() < tiempoLimite) {
+        while (System.currentTimeMillis() < tiempoLimite && mejorFitness > 0) {
             iterTotal++;
 
-            // ── SHAKING (§3.5) ────────────────────────────────────────────────
-            int n = k * batchBase;
-            int[]     ejected   = new int    [n];
-            int[][]   rutasSnap = new int    [n][MAX_SALTOS];
-            long[][]  diasSnap  = new long   [n][MAX_SALTOS];
-            boolean[] rerutado  = new boolean[n];
+            // ── SHAKING ───────────────────────────────────────────────────────
+            int numAExpulsar        = k * batchBase;
+            int[]    idsExpulsados  = new int   [numAExpulsar];
+            int[][]  rutasExp       = new int   [numAExpulsar][MAX_SALTOS];
+            long[][] diasExp        = new long  [numAExpulsar][MAX_SALTOS];
+            int numExpulsados = ejecutarShaking(numAExpulsar, idsExpulsados, rutasExp, diasExp);
 
-            int numEyect = ejecutarShaking(n, ejected, rutasSnap, diasSnap);
-            if (numEyect == 0) { k = (k % K_MAX) + 1; continue; }
-
-            // ── VND (§3.6): N1 → N2 ──────────────────────────────────────────
-            int vndN = 1;
-            while (vndN <= 2 && System.currentTimeMillis() < tiempoLimite) {
-                int mej = (vndN == 1)
-                        ? aplicarVND_N1_MejorRuta(ejected, rutasSnap, diasSnap, rerutado, numEyect)
-                        : aplicarVND_N2_MenosEscalas(ejected, rutasSnap, diasSnap, rerutado, numEyect);
-                vndN = (mej > 0) ? 1 : vndN + 1;
+            // ── VND ───────────────────────────────────────────────────────────
+            int vndNivel = 1;
+            while (vndNivel <= 2
+                    && contarRechazadosActivos() > 0
+                    && System.currentTimeMillis() < tiempoLimite) {
+                int salv = (vndNivel == 1)
+                        ? aplicarVND_N1_Relocate()
+                        : aplicarVND_N2_Exchange();
+                vndNivel = (salv > 0) ? 1 : vndNivel + 1;
             }
 
             // ── CRITERIO DE ACEPTACIÓN ────────────────────────────────────────
-            boolean todoRuteado = true;
-            for (int i = 0; i < numEyect; i++)
-                if (!rerutado[i]) { todoRuteado = false; break; }
-
-            long nuevoTransito = calcularTransitoTotal();
-            if (todoRuteado && nuevoTransito < mejorTransito) {
-                long mejora = mejorTransito - nuevoTransito;
-                mejorTransito = nuevoTransito;
-                mejorasAcum  += numEyect;
-                k = 1;
-                System.out.printf("  [Iter %d] MEJORA -> f(x)=%,d min (-%,d) | k=1%n",
-                        iterTotal, mejorTransito, mejora);
-
-                // Capturar muestras para ExportadorVisual
-                for (int i = 0; i < numEyect && idxMuestraGVNS.get() < 10; i++) {
-                    int idx = idxMuestraGVNS.getAndIncrement();
-                    if (idx < 10) muestraGVNS[idx] = ejected[i];
-                }
+            int nuevoFitness = contarRechazadosActivos();
+            if (nuevoFitness < mejorFitness) {
+                totalSalvados += mejorFitness - nuevoFitness;
+                mejorFitness   = nuevoFitness;
+                k              = 1;
+                System.out.printf("  [Iter %d] MEJORA -> f(x)=%d | acumulado=%d | k=1%n",
+                        iterTotal, mejorFitness, totalSalvados);
             } else {
-                revertirShaking(ejected, rutasSnap, diasSnap, rerutado, numEyect);
+                revertirShaking(idsExpulsados, rutasExp, diasExp, numExpulsados);
                 k = (k % K_MAX) + 1;
-                if (iterTotal % 20 == 0)
-                    System.out.printf("  [Iter %d] Sin mejora | f(x)=%,d | k->%d%n",
-                            iterTotal, nuevoTransito, k);
+                System.out.printf("  [Iter %d] Sin mejora | f(x)=%d | k->%d%n",
+                        iterTotal, nuevoFitness, k);
             }
         }
 
         long tTotal = System.currentTimeMillis() - tiempoInicio;
-        System.out.printf("GVNS Terminado | Iter=%d | Rutas_mejoradas=%d | f_final=%,d min | t=%.2fs%n",
-                iterTotal, mejorasAcum, mejorTransito, tTotal / 1000.0);
-        return mejorasAcum;
+        System.out.printf("GVNS Terminado | Iter=%d | Salvados=%d | f_final=%d | t=%.2fs%n",
+                iterTotal, totalSalvados, mejorFitness, tTotal / 1000.0);
+        return totalSalvados;
     }
 
-    // ── SHAKING: ejectar n envíos ruteados usando LCG ────────────────────────
-    private int ejecutarShaking(int n,
-                                int[]    ejected,
-                                int[][]  rutasSnap,
-                                long[][] diasSnap) {
-        int  count = 0;
-        long seed  = System.nanoTime();
+    // ── SHAKING (Polat et al. §3.9.2 — Perturbation) ─────────────────────────
 
-        outer:
-        for (long i = 0; i < (long) tablero.numEnvios * 3 && count < n; i++) {
+    /**
+     * Expulsa {@code n} envíos asignados de la solución y los devuelve al pool
+     * de rechazados, guardando snapshot de sus rutas para posible reversión.
+     *
+     * <p>La selección de envíos a expulsar usa un generador LCG (Lehmer) para
+     * distribuirlos aleatoriamente en el array de solución. El stride evita
+     * concentrar todos los expulsados en el mismo rango de índices.
+     *
+     * @param n              número de envíos a expulsar.
+     * @param idsExpulsados  array de salida: IDs de los envíos expulsados.
+     * @param rutasExpulsadas array de salida: snapshot de rutas (para revertir).
+     * @param diasExpulsados  array de salida: snapshot de días de salida.
+     * @return número real de envíos expulsados (puede ser &lt; n si no hay suficientes).
+     */
+    private int ejecutarShaking(int n,
+                                int[]    idsExpulsados,
+                                int[][]  rutasExpulsadas,
+                                long[][] diasExpulsados) {
+        int  expulsados = 0;
+        long seed       = System.nanoTime();
+        int  stride     = Math.max(1, tablero.numEnvios / (n * 4));
+
+        for (int i = 0; i < tablero.numEnvios && expulsados < n; i += stride) {
             seed = seed * 6_364_136_223_846_793_005L + 1_442_695_040_888_963_407L;
-            int e = (int) ((seed & Long.MAX_VALUE) % tablero.numEnvios);
+            int e = (int)(Math.abs(seed) % tablero.numEnvios);
 
             if (solucionVuelos[e][0] == -1) continue;
-            for (int j = 0; j < count; j++) if (ejected[j] == e) continue outer;
 
-            ejected[count] = e;
-            System.arraycopy(solucionVuelos[e], 0, rutasSnap[count], 0, MAX_SALTOS);
-            System.arraycopy(solucionDias  [e], 0, diasSnap [count], 0, MAX_SALTOS);
+            idsExpulsados[expulsados] = e;
+            System.arraycopy(solucionVuelos[e], 0, rutasExpulsadas[expulsados], 0, MAX_SALTOS);
+            System.arraycopy(solucionDias[e],   0, diasExpulsados [expulsados], 0, MAX_SALTOS);
 
             for (int s = 0; s < MAX_SALTOS; s++) {
                 if (solucionVuelos[e][s] != -1) {
-                    liberarEspacio(solucionVuelos[e][s], solucionDias[e][s],
-                            tablero.envioMaletas[e]);
+                    liberarEspacio(solucionVuelos[e][s], solucionDias[e][s], tablero.envioMaletas[e]);
                     solucionVuelos[e][s] = -1;
                     solucionDias  [e][s] = -1L;
                 }
             }
+            if (totalRechazados < enviosRechazados.length)
+                enviosRechazados[totalRechazados++] = e;
             enviosExitosos.decrementAndGet();
-            count++;
+            expulsados++;
         }
-        return count;
+        return expulsados;
     }
 
     // ── REVERSIÓN DEL SHAKING ─────────────────────────────────────────────────
-    // ── REVERSIÓN DEL SHAKING — dos pasadas para evitar cascada ─────────────
-    //
-    // Bug del rollback en una sola pasada: si VND asignó el slot original de
-    // shipment A al shipment B, liberar A e inmediatamente intentar restaurarlo
-    // falla porque B aún ocupa ese slot. La solución es desacoplar ambas fases:
-    //   Pasada 1: liberar TODAS las rutas asignadas por VND.
-    //   Pasada 2: restaurar TODAS las rutas originales (slots ya liberados).
-    private void revertirShaking(int[]     ejected,
-                                 int[][]   rutasSnap,
-                                 long[][]  diasSnap,
-                                 boolean[] rerutado,
-                                 int       n) {
-        // Pasada 1: liberar rutas VND
-        for (int i = 0; i < n; i++) {
-            int e = ejected[i];
-            if (rerutado[i] && solucionVuelos[e][0] != -1) {
+
+    /**
+     * Restaura los envíos expulsados por {@link #ejecutarShaking} a su estado
+     * anterior (si la iteración GVNS no produjo mejora).
+     *
+     * <p>Para cada envío expulsado: intenta re-reservar su ruta original.
+     * Si la re-reserva falla (otro envío tomó esa capacidad durante el VND),
+     * el envío queda en el pool de rechazados (comportamiento aceptable:
+     * el VND ya encontró al menos una alternativa).
+     */
+    private void revertirShaking(int[]    idsExpulsados,
+                                 int[][]  rutasExpulsadas,
+                                 long[][] diasExpulsados,
+                                 int      numExpulsados) {
+        for (int i = 0; i < numExpulsados; i++) {
+            int e = idsExpulsados[i];
+
+            if (solucionVuelos[e][0] != -1) {
                 for (int s = 0; s < MAX_SALTOS; s++) {
                     if (solucionVuelos[e][s] != -1) {
                         liberarEspacio(solucionVuelos[e][s], solucionDias[e][s],
@@ -659,158 +762,182 @@ public class PlanificadorGVNSConcurrente {
                 }
                 enviosExitosos.decrementAndGet();
             }
-        }
 
-        // Pasada 2: restaurar rutas originales (slots ya liberados en pasada 1)
-        for (int i = 0; i < n; i++) {
-            int e = ejected[i];
-            if (reservarRuta(rutasSnap[i], diasSnap[i], tablero.envioMaletas[e])) {
-                System.arraycopy(rutasSnap[i], 0, solucionVuelos[e], 0, MAX_SALTOS);
-                System.arraycopy(diasSnap [i], 0, solucionDias  [e], 0, MAX_SALTOS);
-                enviosExitosos.incrementAndGet();
+            boolean restaurado = true;
+            for (int s = 0; s < MAX_SALTOS; s++) {
+                if (rutasExpulsadas[i][s] == -1) continue;
+                if (!intentarReservarEspacio(rutasExpulsadas[i][s],
+                        diasExpulsados[i][s], tablero.envioMaletas[e])) {
+                    for (int s2 = 0; s2 < s; s2++) {
+                        if (rutasExpulsadas[i][s2] != -1)
+                            liberarEspacio(rutasExpulsadas[i][s2],
+                                    diasExpulsados[i][s2], tablero.envioMaletas[e]);
+                    }
+                    restaurado = false;
+                    break;
+                }
             }
-            // Fallo extremadamente raro: slot original consumido por un shipment
-            // NO eyectado en este shaking. No puede ocurrir si el dataset tiene
-            // suficiente holgura de capacidad (confirmado: 0 rechazados en Fase 2).
+
+            if (restaurado) {
+                System.arraycopy(rutasExpulsadas[i], 0, solucionVuelos[e], 0, MAX_SALTOS);
+                System.arraycopy(diasExpulsados [i], 0, solucionDias  [e], 0, MAX_SALTOS);
+                enviosExitosos.incrementAndGet();
+                eliminarDeRechazados(e);
+            }
         }
     }
 
-    // ── VND N1: re-rutear con mínimo tiempo de tránsito ─────────────────────
-    private int aplicarVND_N1_MejorRuta(int[]     ejected,
-                                         int[][]   rutasSnap,
-                                         long[][]  diasSnap,
-                                         boolean[] rerutado,
-                                         int       n) {
-        AtomicInteger mejoradas = new AtomicInteger(0);
+    // ── VND N1: Relocate (Polat et al. §3.6 — Best Insert adaptado) ──────────
 
-        IntStream.range(0, n).parallel().forEach(i -> {
-            int e = ejected[i];
+    /**
+     * Vecindad N1 — Relocate: intenta insertar cada envío rechazado en la red
+     * buscando cualquier ruta factible mediante DFS.
+     *
+     * <p>Equivale al operador "Best Insert" del paper pero sin evaluar todas las
+     * posiciones: simplemente busca la primera ruta factible (DFS).
+     * Ejecutado en paralelo sobre el pool de rechazados.
+     *
+     * @return número de envíos salvados en esta pasada.
+     */
+    private int aplicarVND_N1_Relocate() {
+        AtomicInteger salvados = new AtomicInteger(0);
 
-            int[]  rt = new int [MAX_SALTOS]; Arrays.fill(rt, -1);
-            long[] dt = new long[MAX_SALTOS]; Arrays.fill(dt, -1L);
+        IntStream.range(0, totalRechazados).parallel().forEach(i -> {
+            int e = enviosRechazados[i];
+            if (e == -1) return;
 
-            long tNuevo = buscarMejorRuta(e, rt, dt);
-            if (tNuevo == Long.MAX_VALUE) return;
+            int[]  rutaTemp = new int [MAX_SALTOS];
+            long[] diasTemp = new long[MAX_SALTOS];
+            Arrays.fill(rutaTemp, -1);
+            Arrays.fill(diasTemp, -1L);
 
-            // Tránsito original de este envío
-            int  ls    = ultimoSalto(rutasSnap[i]);
-            long tOrig = (diasSnap[i][ls] + duracionVuelo(rutasSnap[i][ls]))
-                       - tablero.envioRegistroUTC[e];
+            boolean encontro = buscarRutaDFS(
+                    tablero.envioOrigen[e],    tablero.envioDestino[e],
+                    tablero.envioMaletas[e],   tablero.envioRegistroUTC[e],
+                    tablero.envioDeadlineUTC[e], 0, rutaTemp, diasTemp);
 
-            System.arraycopy(rt, 0, solucionVuelos[e], 0, MAX_SALTOS);
-            System.arraycopy(dt, 0, solucionDias  [e], 0, MAX_SALTOS);
-            enviosExitosos.incrementAndGet();
-            rerutado[i] = true;
+            if (encontro) {
+                System.arraycopy(rutaTemp, 0, solucionVuelos[e], 0, MAX_SALTOS);
+                System.arraycopy(diasTemp, 0, solucionDias  [e], 0, MAX_SALTOS);
+                enviosRechazados[i] = -1;
+                enviosExitosos.incrementAndGet();
+                salvados.incrementAndGet();
 
-            if (tNuevo < tOrig) mejoradas.incrementAndGet();
+                // Capturar muestra para ExportadorVisual
+                int idx = idxMuestraGVNS.getAndIncrement();
+                if (idx < 10) muestraGVNS[idx] = e;
+            }
         });
 
-        return mejoradas.get();
+        return salvados.get();
     }
 
-    // ── VND N2: DFS para no-ruteados; reducir saltos para multi-hop ──────────
-    //
-    // Complementa N1 en dos dimensiones distintas:
-    //   a) Envíos que N1 no pudo rutear → DFS exhaustivo (mayor cobertura).
-    //   b) Envíos ruteados por N1 con >1 tramo → intentar vuelo directo más
-    //      temprano para reducir escalas (barrio estructuralmente diferente a N1).
-    private int aplicarVND_N2_MenosEscalas(int[]     ejected,
-                                             int[][]   rutasSnap,
-                                             long[][]  diasSnap,
-                                             boolean[] rerutado,
-                                             int       n) {
-        AtomicInteger mejoradas = new AtomicInteger(0);
+    // ── VND N2: Exchange (Polat et al. §3.7 — 1-1 Exchange adaptado) ─────────
 
-        IntStream.range(0, n).parallel().forEach(i -> {
-            int e = ejected[i];
+    /**
+     * Vecindad N2 — Exchange: para cada envío rechazado, busca un vuelo directo
+     * que esté lleno, libera temporalmente su capacidad, intenta insertar el
+     * rechazado via DFS, y restaura la capacidad original.
+     *
+     * <p>Modela el intercambio de Shift Operator del paper: un envío cede su
+     * lugar para que otro pueda ocuparlo, ampliando el espacio de búsqueda
+     * más allá de lo que N1 puede alcanzar.
+     *
+     * @return número de envíos salvados en esta pasada.
+     */
+    private int aplicarVND_N2_Exchange() {
+        AtomicInteger salvados = new AtomicInteger(0);
 
-            if (!rerutado[i]) {
-                // a) N1 falló: DFS exhaustivo
-                int[]  rt = new int [MAX_SALTOS]; Arrays.fill(rt, -1);
-                long[] dt = new long[MAX_SALTOS]; Arrays.fill(dt, -1L);
-                if (buscarRutaDFS(tablero.envioOrigen[e], tablero.envioDestino[e],
-                        tablero.envioMaletas[e], tablero.envioRegistroUTC[e],
-                        tablero.envioDeadlineUTC[e], 0, rt, dt)) {
-                    System.arraycopy(rt, 0, solucionVuelos[e], 0, MAX_SALTOS);
-                    System.arraycopy(dt, 0, solucionDias  [e], 0, MAX_SALTOS);
-                    enviosExitosos.incrementAndGet();
-                    rerutado[i] = true;
-                    mejoradas.incrementAndGet();
-                }
-                return;
-            }
+        IntStream.range(0, totalRechazados).parallel().forEach(i -> {
+            int e = enviosRechazados[i];
+            if (e == -1) return;
 
-            // b) N1 tuvo éxito pero ruta usa >1 tramo → intentar vuelo directo
-            int hops = 0;
-            for (int s = 0; s < MAX_SALTOS; s++) if (solucionVuelos[e][s] != -1) hops++;
-            if (hops <= 1) return;
-
-            int  ori = tablero.envioOrigen[e], des = tablero.envioDestino[e];
-            int  mal = tablero.envioMaletas[e];
-            long tReg = tablero.envioRegistroUTC[e], dl = tablero.envioDeadlineUTC[e];
-
-            long bestDirLle = Long.MAX_VALUE;
-            int  bestDirV   = -1;
-            long bestDirSal = -1L;
+            int  origen    = tablero.envioOrigen[e];
+            int  destino   = tablero.envioDestino[e];
+            int  maletas   = tablero.envioMaletas[e];
+            long tRegistro = tablero.envioRegistroUTC[e];
+            long deadline  = tablero.envioDeadlineUTC[e];
 
             for (int v = 0; v < tablero.numVuelos; v++) {
-                if (tablero.vueloOrigen[v] != ori || tablero.vueloDestino[v] != des) continue;
-                long sal = calcularMinutoSalidaReal(tReg, tablero.vueloSalidaUTC[v]);
-                long lle = sal + duracionVuelo(v);
-                if (lle + TIEMPO_MINIMO_ESCALA > dl) continue;
-                if (lle < bestDirLle) { bestDirLle = lle; bestDirV = v; bestDirSal = sal; }
-            }
+                if (tablero.vueloOrigen[v] != origen) continue;
 
-            if (bestDirV != -1 && intentarReservarEspacio(bestDirV, bestDirSal, mal)) {
-                // Liberar ruta multi-hop que asignó N1
-                for (int s = 0; s < MAX_SALTOS; s++) {
-                    if (solucionVuelos[e][s] != -1)
-                        liberarEspacio(solucionVuelos[e][s], solucionDias[e][s], mal);
+                long salAbs = calcularMinutoSalidaReal(tRegistro, tablero.vueloSalidaUTC[v]);
+                long lleAbs = salAbs + duracionVuelo(v);
+                if (lleAbs + TIEMPO_MINIMO_ESCALA > deadline) continue;
+
+                long key = claveVueloDia(v, salAbs);
+                ocupacionVuelos.putIfAbsent(key, new AtomicInteger(0));
+                AtomicInteger ocu = ocupacionVuelos.get(key);
+
+                if (ocu.get() + maletas <= tablero.vueloCapacidad[v]) continue;
+
+                synchronized (ocu) {
+                    if (enviosRechazados[i] == -1) return;
+
+                    if (ocu.get() + maletas > tablero.vueloCapacidad[v]) {
+                        ocu.addAndGet(-maletas);
+
+                        int[]  rutaTemp = new int [MAX_SALTOS];
+                        long[] diasTemp = new long[MAX_SALTOS];
+                        Arrays.fill(rutaTemp, -1);
+                        Arrays.fill(diasTemp, -1L);
+
+                        boolean encontroRuta = buscarRutaDFS(
+                                origen, destino, maletas, tRegistro, deadline,
+                                0, rutaTemp, diasTemp);
+
+                        ocu.addAndGet(maletas);
+
+                        if (encontroRuta) {
+                            System.arraycopy(rutaTemp, 0, solucionVuelos[e], 0, MAX_SALTOS);
+                            System.arraycopy(diasTemp, 0, solucionDias  [e], 0, MAX_SALTOS);
+                            enviosRechazados[i] = -1;
+                            enviosExitosos.incrementAndGet();
+                            salvados.incrementAndGet();
+
+                            // Capturar muestra para ExportadorVisual
+                            int idx = idxMuestraGVNS.getAndIncrement();
+                            if (idx < 10) muestraGVNS[idx] = e;
+                            return;
+                        }
+                    }
                 }
-                Arrays.fill(solucionVuelos[e], -1);
-                Arrays.fill(solucionDias  [e], -1L);
-                solucionVuelos[e][0] = bestDirV;
-                solucionDias  [e][0] = bestDirSal;
-                mejoradas.incrementAndGet();
             }
         });
 
-        return mejoradas.get();
+        return salvados.get();
     }
 
     // =========================================================================
-    // EXPORTACIÓN CSV DE MÉTRICAS — para análisis experimental
+    // EXPORTACIÓN CSV DE MÉTRICAS
     // =========================================================================
 
     /**
-     * Exporta métricas de rendimiento en formato CSV.
+     * Exporta métricas de la ejecución completa (Fase 2 + Fase 3) a un archivo CSV.
      *
-     * @param nombreArchivo   path del archivo CSV a crear
-     * @param transitoInicial f(x) tras Fase 2, antes de GVNS (minutos)
-     * @param tiempoGreedy    segundos de CPU — Fase 2
-     * @param tiempoGVNS      segundos de CPU — Fase 3
-     * @param rutasMejoradas  rutas mejoradas por GVNS
+     * <p>Columnas: Total Envíos, Exitosos, Rechazados iniciales, Salvados por GVNS,
+     * Rechazados finales, tiempos de CPU y tasa de éxito final.
+     *
+     * @param nombreArchivo ruta del archivo CSV de salida.
+     * @param tiempoGreedy  segundos de CPU invertidos en la Fase 2.
+     * @param tiempoGVNS    segundos de CPU invertidos en la Fase 3.
+     * @param salvadosGVNS  envíos recuperados por N1+N2 en la Fase 3.
      */
     public void exportarResultadosCSV(String nombreArchivo,
-                                      long   transitoInicial,
                                       double tiempoGreedy,
                                       double tiempoGVNS,
-                                      int    rutasMejoradas) {
-        long transitoFinal = calcularTransitoTotal();
+                                      int    salvadosGVNS) {
         try (PrintWriter pw = new PrintWriter(new FileWriter(nombreArchivo))) {
             pw.println("Metrica,Valor");
-            pw.println("Total Envios,"                  + tablero.numEnvios);
-            pw.println("Exitosos Final,"                 + enviosExitosos.get());
-            pw.println("Rutas Mejoradas GVNS,"           + rutasMejoradas);
-            pw.println("Transito Total Inicial (min),"   + transitoInicial);
-            pw.println("Transito Total Final (min),"     + transitoFinal);
-            double mejora = (transitoInicial > 0)
-                    ? (transitoInicial - transitoFinal) * 100.0 / transitoInicial : 0;
-            pw.println("Mejora GVNS (%),"                + String.format("%.4f", mejora));
-            pw.println("Tiempo Greedy (s),"              + tiempoGreedy);
-            pw.println("Tiempo GVNS (s),"                + tiempoGVNS);
+            pw.println("Total Envios,"         + tablero.numEnvios);
+            pw.println("Exitosos Total,"        + enviosExitosos.get());
+            pw.println("Rechazados Iniciales,"  + totalRechazados);
+            pw.println("Salvados GVNS (N1+N2)," + salvadosGVNS);
+            pw.println("Rechazados Finales,"     + contarRechazadosActivos());
+            pw.println("Tiempo Greedy (s),"      + tiempoGreedy);
+            pw.println("Tiempo GVNS (s),"        + tiempoGVNS);
             double tasa = (enviosExitosos.get() / (double) tablero.numEnvios) * 100.0;
-            pw.println("Tasa Exito Final (%),"           + String.format("%.4f", tasa));
+            pw.println("Tasa Exito Final (%),"  + String.format("%.4f", tasa));
             System.out.println("Resultados exportados: " + nombreArchivo);
         } catch (Exception ex) {
             System.err.println("Error al exportar CSV: " + ex.getMessage());
