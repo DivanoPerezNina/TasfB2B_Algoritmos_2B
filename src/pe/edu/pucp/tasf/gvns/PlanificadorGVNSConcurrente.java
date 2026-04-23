@@ -916,31 +916,65 @@ public class PlanificadorGVNSConcurrente {
      * Exporta métricas de la ejecución completa (Fase 2 + Fase 3) a un archivo CSV.
      *
      * <p>Columnas: Total Envíos, Exitosos, Rechazados iniciales, Salvados por GVNS,
-     * Rechazados finales, tiempos de CPU y tasa de éxito final.
+     * Rechazados finales, tránsito Fase 2, tiempos de CPU y tasa de éxito final.
      *
      * @param nombreArchivo ruta del archivo CSV de salida.
+     * @param transitoFase2 tránsito total al finalizar la Fase 2 (minutos).
      * @param tiempoGreedy  segundos de CPU invertidos en la Fase 2.
      * @param tiempoGVNS    segundos de CPU invertidos en la Fase 3.
      * @param salvadosGVNS  envíos recuperados por N1+N2 en la Fase 3.
      */
     public void exportarResultadosCSV(String nombreArchivo,
+                                      long   transitoFase2,
                                       double tiempoGreedy,
                                       double tiempoGVNS,
                                       int    salvadosGVNS) {
         try (PrintWriter pw = new PrintWriter(new FileWriter(nombreArchivo))) {
             pw.println("Metrica,Valor");
-            pw.println("Total Envios,"         + tablero.numEnvios);
-            pw.println("Exitosos Total,"        + enviosExitosos.get());
-            pw.println("Rechazados Iniciales,"  + totalRechazados);
-            pw.println("Salvados GVNS (N1+N2)," + salvadosGVNS);
-            pw.println("Rechazados Finales,"     + contarRechazadosActivos());
-            pw.println("Tiempo Greedy (s),"      + tiempoGreedy);
-            pw.println("Tiempo GVNS (s),"        + tiempoGVNS);
+            pw.println("Total Envios,"           + tablero.numEnvios);
+            pw.println("Exitosos Total,"          + enviosExitosos.get());
+            pw.println("Rechazados Iniciales,"    + totalRechazados);
+            pw.println("Salvados GVNS (N1+N2),"   + salvadosGVNS);
+            pw.println("Rechazados Finales,"       + contarRechazadosActivos());
+            pw.println("Transito Fase2 (min),"     + transitoFase2);
+            pw.println("Transito Final (min),"     + calcularTransitoTotal());
+            pw.println("Tiempo Greedy (s),"        + tiempoGreedy);
+            pw.println("Tiempo GVNS (s),"          + tiempoGVNS);
             double tasa = (enviosExitosos.get() / (double) tablero.numEnvios) * 100.0;
-            pw.println("Tasa Exito Final (%),"  + String.format("%.4f", tasa));
+            pw.println("Tasa Exito Final (%),"    + String.format("%.4f", tasa));
             System.out.println("Resultados exportados: " + nombreArchivo);
         } catch (Exception ex) {
             System.err.println("Error al exportar CSV: " + ex.getMessage());
         }
+    }
+
+    /**
+     * Calcula el tránsito total de todos los envíos asignados: suma de
+     * (tiempo de llegada al destino − tiempo de registro del envío) en minutos.
+     *
+     * <p>Métrica de calidad de la solución: menor tránsito = maletas llegan
+     * antes. Se usa para comparar la Fase 2 (construcción) contra la Fase 3
+     * (GVNS) y medir la mejora del algoritmo.
+     *
+     * @return suma de tiempos de tránsito en minutos; 0 si no hay asignados.
+     */
+    public long calcularTransitoTotal() {
+        long total = 0L;
+        for (int e = 0; e < tablero.numEnvios; e++) {
+            if (solucionVuelos[e][0] == -1) continue;
+
+            // Encontrar el índice del último tramo asignado
+            int ultimoTramo = 0;
+            for (int s = 1; s < MAX_SALTOS; s++) {
+                if (solucionVuelos[e][s] == -1) break;
+                ultimoTramo = s;
+            }
+
+            int  v       = solucionVuelos[e][ultimoTramo];
+            long salida  = solucionDias[e][ultimoTramo];
+            long llegada = salida + duracionVuelo(v);
+            total += llegada - tablero.envioRegistroUTC[e];
+        }
+        return total;
     }
 }
