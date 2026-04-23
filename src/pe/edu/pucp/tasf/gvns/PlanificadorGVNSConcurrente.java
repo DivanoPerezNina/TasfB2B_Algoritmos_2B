@@ -3,6 +3,7 @@ package pe.edu.pucp.tasf.gvns;
 import java.io.FileWriter;
 import java.io.PrintWriter;
 import java.util.Arrays;
+import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
@@ -10,64 +11,136 @@ import java.util.stream.IntStream;
 /**
  * Planificador GVNS Concurrente — Iteración 3
  *
- * Basado en: Polat, Kalayci & Topaloglu (2026). Soft Computing 30, 327-352.
- * Problema: Single-Path Unsplittable Multicommodity Network Flow with Time Windows.
+ * Basado en: Polat, Kalayci &amp; Topaloglu (2026). Soft Computing 30, 327-352.
+ * "An enhanced variable neighborhood search algorithm for rich multi-compartment
+ * vehicle routing problems."
  *
- * ── CAMBIOS DE ESTA ITERACIÓN (Objetivo 2) ──────────────────────────────────
- * Fase 2 reemplaza el DFS recursivo por una inserción golosa iterativa de
- * 3 niveles (análoga al ALNS del equipo rival, pero con validación real de
- * capacidad mediante ConcurrentHashMap + AtomicInteger):
- *   Nivel 1 → Vuelo Directo (1 tramo)
- *   Nivel 2 → 1 Escala     (2 tramos)
- *   Nivel 3 → 2 Escalas    (3 tramos)
- * El DFS recursivo permanece exclusivamente en la Fase 3 (VND N1/N2).
+ * Adaptación al problema de rutas de equipaje en redes de vuelos (Single-Path
+ * Unsplittable Multicommodity Network Flow with Time Windows):
+ *   - "Vehículo"    → Vuelo con capacidad de maletas.
+ *   - "Cliente"     → Envío (origen, destino, maletas, ventana de tiempo).
+ *   - "Ruta"        → Secuencia de vuelos (máximo MAX_SALTOS tramos).
  *
- * Se añaden arrays de muestra (muestraFase2[], muestraGVNS[]) para
- * ExportadorVisual sin coste de Heap adicional.
+ * ── ESTRUCTURA DEL ALGORITMO (Polat et al. §3.2) ────────────────────────────
+ *  Fase 2 — Solución inicial (§3.4):
+ *    1. Permutación aleatoria de los envíos (Fisher-Yates con semilla fija).
+ *    2. Para cada envío en ese orden: asignar la primera ruta factible
+ *       encontrada por búsqueda greedy de 3 niveles (directo / 1 escala /
+ *       2 escalas). Los no asignados van al pool de rechazados.
+ *  Fase 3 — Mejora GVNS (§3.2):
+ *    Loop hasta tiempo límite o f(x)=0:
+ *      · Shaking:     expulsar k*batch envíos asignados → pool de rechazados.
+ *      · VND N1:      intentar re-insertar rechazados vía DFS (Relocate).
+ *      · VND N2:      liberar un vuelo temporalmente y re-insertar (Exchange).
+ *      · Aceptación:  si mejora, k=1; si no, k=(k%K_MAX)+1 y se revierte.
  *
  * ── RESTRICCIONES ARQUITECTÓNICAS NO NEGOCIABLES ────────────────────────────
- *   - Arrays primitivos int[], long[] para datos masivos.
- *   - ConcurrentHashMap<Long, AtomicInteger> + CAS loop (lock-free).
- *   - parallel streams para VND; Shaking es secuencial (necesita snapshot).
+ *   - Arrays primitivos int[], long[] para datos masivos (sin ArrayList<Object>).
+ *   - ConcurrentHashMap<Long, AtomicInteger> + CAS loop (lock-free, sin mutex).
+ *   - Parallel streams en Fase 2 y VND; Shaking secuencial (requiere snapshot).
  */
 public class PlanificadorGVNSConcurrente {
 
+    // ── DATOS DEL PROBLEMA ───────────────────────────────────────────────────
+    /** Red de vuelos y envíos cargados por GestorDatos. */
     private GestorDatos tablero;
+
+    /**
+     * solucionVuelos[e][s] = índice del vuelo en el tramo s del envío e.
+     * -1 indica que el tramo no existe (envío directo usa solo s=0).
+     */
     public int[][]  solucionVuelos;
+
+    /**
+     * solucionDias[e][s] = minuto UTC absoluto de salida del tramo s del envío e.
+     * Permite reconstruir la cadena temporal de la ruta sin recalcular.
+     */
     public long[][] solucionDias;
 
-    // --- POOL DE RECHAZADOS ---
+    // ── POOL DE RECHAZADOS ───────────────────────────────────────────────────
+    /**
+     * Envíos que no encontraron ruta factible en Fase 2 (o expulsados en Shaking).
+     * La Fase 3 (VND N1/N2) intentará re-insertarlos.
+     * Entradas marcadas -1 = ya salvados (espacios reutilizables).
+     */
     public int[] enviosRechazados = new int[500_000];
+    /** Número de posiciones ocupadas en enviosRechazados[] (incluye los -1). */
     public int   totalRechazados  = 0;
 
-    // --- PARÁMETROS DE NEGOCIO ---
+    // ── PARÁMETROS DE NEGOCIO ────────────────────────────────────────────────
+    /** Tiempo mínimo de escala entre dos vuelos consecutivos (minutos). */
     public final int TIEMPO_MINIMO_ESCALA = 10;
+    /** Máximo de tramos por ruta. 3 = directo, 1 escala o 2 escalas. */
     public final int MAX_SALTOS           = 3;
 
-    // --- PARÁMETROS GVNS (Polat et al., 2026 — Tabla 3) ---
+    // ── PARÁMETROS GVNS (Polat et al. 2026, Tabla 3) ─────────────────────────
+    /** Tiempo de CPU máximo para la Fase 3 (ms). */
     private static final long TIEMPO_LIMITE_MS = 120_000L;
+    /** Número máximo de estructuras de vecindad (k_max en el paper). */
     private static final int  K_MAX            = 3;
+    /** Envíos expulsados por iteración de Shaking en k=1 (escala con k). */
     private static final int  BATCH_FACTOR     = 20;
 
-    // --- SINCRONIZACIÓN ---
+    // ── ALEATORIEDAD — FASE 2 (Polat et al. §3.4) ────────────────────────────
+    /**
+     * Semilla para el generador de números aleatorios.
+     * Determina el orden de procesamiento de envíos en la Fase 2.
+     * Semilla fija → resultados reproducibles entre ejecuciones.
+     */
+    private final long   semilla;
+    /**
+     * Generador de números aleatorios seeded para la permutación inicial.
+     * Solo se usa en construirSolucionInicial() (hilo principal, sin concurrencia).
+     */
+    private final Random rng;
+
+    // ── SINCRONIZACIÓN ───────────────────────────────────────────────────────
+    /** Mutex para escrituras en el pool de rechazados (escritura rara). */
     private final Object lockRechazados = new Object();
+    /** Contador atómico de envíos con ruta asignada (Fase 2 + Fase 3). */
     public  AtomicInteger enviosExitosos = new AtomicInteger(0);
+    /**
+     * Mapa de ocupación de vuelos.
+     * Clave: claveVueloDia(v, salidaAbsoluta) → vuelo v en el día de salidaAbsoluta.
+     * Valor: maletas actualmente reservadas en ese vuelo-día.
+     * Acceso lock-free mediante CAS (compareAndSet) en intentarReservarEspacio().
+     */
     public  ConcurrentHashMap<Long, AtomicInteger> ocupacionVuelos = new ConcurrentHashMap<>();
 
-    // --- MUESTRAS PARA ExportadorVisual ---
-    /** Primeros 100 envíos ruteados exitosamente en Fase 2. */
-    public final int[]        muestraFase2    = new int[100];
+    // ── MUESTRAS PARA ExportadorVisual ───────────────────────────────────────
+    /** Primeros 100 envíos ruteados exitosamente en Fase 2 (para JSON de muestra). */
+    public final int[]          muestraFase2    = new int[100];
     private final AtomicInteger idxMuestraFase2 = new AtomicInteger(0);
 
-    /** Primeros 10 envíos salvados por la Fase 3 (GVNS). */
-    public final int[]        muestraGVNS     = new int[10];
+    /** Primeros 10 envíos salvados por la Fase 3 GVNS (para JSON de muestra). */
+    public final int[]          muestraGVNS     = new int[10];
     private final AtomicInteger idxMuestraGVNS  = new AtomicInteger(0);
 
     // =========================================================================
-    // CONSTRUCTOR
+    // CONSTRUCTORES
     // =========================================================================
+
+    /**
+     * Constructor con semilla por defecto (12345).
+     * Equivalente a {@code new PlanificadorGVNSConcurrente(datos, 12345L)}.
+     */
     public PlanificadorGVNSConcurrente(GestorDatos datos) {
+        this(datos, 12345L);
+    }
+
+    /**
+     * Constructor principal.
+     *
+     * @param datos   Red de vuelos y envíos ya cargada por GestorDatos.
+     * @param semilla Semilla para la permutación aleatoria de la Fase 2 (§3.4).
+     *                Misma semilla → mismo orden de procesamiento → resultados reproducibles.
+     */
+    public PlanificadorGVNSConcurrente(GestorDatos datos, long semilla) {
         this.tablero        = datos;
+        this.semilla        = semilla;
+        this.rng            = new Random(semilla);
+
+        // Matrices de solución: -1 = tramo sin asignar
         this.solucionVuelos = new int [datos.numEnvios][MAX_SALTOS];
         this.solucionDias   = new long[datos.numEnvios][MAX_SALTOS];
 
@@ -83,22 +156,68 @@ public class PlanificadorGVNSConcurrente {
     // =========================================================================
     // ACCESORES DE MUESTRA (para ExportadorVisual)
     // =========================================================================
+
+    /** Número de envíos capturados en muestraFase2[] (máximo 100). */
     public int cantMuestraFase2() { return Math.min(idxMuestraFase2.get(), 100); }
+
+    /** Número de envíos capturados en muestraGVNS[] (máximo 10). */
     public int cantMuestraGVNS()  { return Math.min(idxMuestraGVNS.get(),  10); }
 
     // =========================================================================
-    // FASE 2: CONSTRUCCIÓN GOLOSA — OBJETIVO 2
+    // FASE 2: CONSTRUCCIÓN DE LA SOLUCIÓN INICIAL — Polat et al. (2026) §3.4
     //
-    // Reemplaza el DFS recursivo por buscarRutaGreedy() (inserción iterativa de
-    // 3 niveles). La razón: el DFS explora todo el árbol de rutas con backtracking;
-    // el greedy es O(V) / O(V²) / O(V³) en 1/2/3 saltos y no hace backtracking,
-    // lo que lo hace 3-5× más rápido en la fase de construcción masiva.
-    // La complejidad de exploración (VND) se reserva para la Fase 3.
+    // El paper establece un proceso de 3 pasos:
+    //   PASO 1: "the sequence of orders is established through a random generation"
+    //           → Permutación aleatoria de los índices de envío (Fisher-Yates).
+    //   PASO 2: "this random sequence serves as the basis for determining the
+    //            specific customers to be visited"
+    //           → Iterar sobre la permutación para determinar qué envíos procesar.
+    //   PASO 3: "the final step involves the allocation of vehicles to designated tours"
+    //           → Para cada envío en orden aleatorio: asignar la primera ruta
+    //             factible hallada por búsqueda greedy de 3 niveles.
+    //
+    // La búsqueda greedy (buscarRutaGreedy) es equivalente al "allocation of
+    // vehicles to tours": evalúa vuelo directo → 1 escala → 2 escalas y reserva
+    // capacidad atómicamente (CAS). Envíos sin ruta van al pool de rechazados
+    // (análogos a "placeholder vehicles incurring penalties" del paper).
+    //
+    // El orden aleatorio es la diferencia fundamental respecto a la versión
+    // anterior (greedy secuencial 0..N-1). Con capacidad limitada, el orden de
+    // procesamiento determina qué envíos "ganan" los asientos disponibles.
+    // La aleatoriedad evita el sesgo sistemático por ID de envío.
+    //
+    // Complejidad por envío: O(V) directo / O(V²) 1 escala / O(V³) 2 escalas.
+    // El DFS recursivo (exploración completa) se reserva para la Fase 3.
     // =========================================================================
-    public void construirSolucionInicial() {
-        System.out.println("Fase 2: Construccion Golosa Iterativa (3 niveles, multihilo)...");
 
-        IntStream.range(0, tablero.numEnvios).parallel().forEach(e -> {
+    /**
+     * Construye la solución inicial asignando rutas a todos los envíos.
+     *
+     * <p>Sigue el proceso descrito en Polat et al. (2026) §3.4:
+     * <ol>
+     *   <li>Genera una permutación aleatoria de los índices de envío.</li>
+     *   <li>Procesa cada envío en ese orden aleatorio (en paralelo).</li>
+     *   <li>Asigna la primera ruta factible (directo / 1 escala / 2 escalas).</li>
+     *   <li>Envíos sin ruta quedan en el pool de rechazados para la Fase 3.</li>
+     * </ol>
+     */
+    public void construirSolucionInicial() {
+        System.out.printf("Fase 2: Construccion Inicial Aleatoria + Greedy (semilla=%d, multihilo)...%n",
+                semilla);
+
+        // PASO 1 (§3.4): Permutación aleatoria de pedidos.
+        // "the sequence of orders is established through a random generation,
+        //  taking into account the aggregate number of orders to be fulfilled."
+        // La semilla fija garantiza reproducibilidad entre ejecuciones.
+        int[] permutacion = generarPermutacionAleatoria(tablero.numEnvios);
+
+        // PASO 2-3 (§3.4): Procesar envíos en el orden aleatorio y asignar rutas.
+        // Cada hilo accede a permutacion[idx] para obtener el índice real del envío.
+        // La escritura en solucionVuelos[e] y solucionDias[e] es segura porque
+        // cada índice 'e' es único (no hay dos hilos escribiendo en la misma fila).
+        IntStream.range(0, tablero.numEnvios).parallel().forEach(idx -> {
+            int e = permutacion[idx]; // índice real del envío en orden aleatorio
+
             int  origen    = tablero.envioOrigen[e];
             int  destino   = tablero.envioDestino[e];
             int  maletas   = tablero.envioMaletas[e];
@@ -108,21 +227,24 @@ public class PlanificadorGVNSConcurrente {
             int[]  rutaTemp = new int [MAX_SALTOS];
             long[] diasTemp = new long[MAX_SALTOS];
 
-            // ── GREEDY ITERATIVO (no DFS) ─────────────────────────────────────
+            // Buscar y reservar la primera ruta factible (greedy, sin backtracking).
             boolean encontroRuta = buscarRutaGreedy(
                     origen, destino, maletas, tRegistro, deadline, rutaTemp, diasTemp);
 
             if (encontroRuta) {
-                // Escritura segura: cada hilo escribe en su propio índice 'e'
+                // Escritura segura: cada hilo escribe exclusivamente en su índice 'e'.
                 System.arraycopy(rutaTemp, 0, solucionVuelos[e], 0, MAX_SALTOS);
                 System.arraycopy(diasTemp, 0, solucionDias[e],   0, MAX_SALTOS);
                 enviosExitosos.incrementAndGet();
 
-                // Capturar muestra para ExportadorVisual (primeros 100)
-                int idx = idxMuestraFase2.getAndIncrement();
-                if (idx < 100) muestraFase2[idx] = e;
+                // Guardar en muestra para ExportadorVisual (primeros 100 exitosos).
+                int mi = idxMuestraFase2.getAndIncrement();
+                if (mi < 100) muestraFase2[mi] = e;
 
             } else {
+                // Sin ruta: va al pool de rechazados (Fase 3 intentará reasignarlos).
+                // "tours are temporarily assigned to placeholder vehicles,
+                //  a practice that incurs penalties" — paper §3.4.
                 synchronized (lockRechazados) {
                     if (totalRechazados < enviosRechazados.length)
                         enviosRechazados[totalRechazados++] = e;
@@ -134,21 +256,75 @@ public class PlanificadorGVNSConcurrente {
                 enviosExitosos.get(), tablero.numEnvios, totalRechazados);
     }
 
+    /**
+     * Genera una permutación aleatoria de [0, n) usando el algoritmo Fisher-Yates.
+     *
+     * <p>El algoritmo garantiza que todas las n! permutaciones posibles son
+     * equiprobables. La semilla del campo {@code rng} hace la permutación
+     * determinista: misma semilla → mismo orden.
+     *
+     * <p>Referencia: Polat et al. (2026) §3.4 — "the sequence of orders is
+     * established through a random generation".
+     *
+     * @param n número de elementos (= número de envíos).
+     * @return array de longitud n con los índices 0..n-1 en orden aleatorio.
+     */
+    private int[] generarPermutacionAleatoria(int n) {
+        int[] perm = new int[n];
+        for (int i = 0; i < n; i++) perm[i] = i;
+
+        // Fisher-Yates shuffle: recorre de derecha a izquierda e intercambia
+        // cada posición con una posición aleatoria anterior (o igual).
+        for (int i = n - 1; i > 0; i--) {
+            int j = rng.nextInt(i + 1); // 0 <= j <= i
+            int tmp = perm[i];
+            perm[i] = perm[j];
+            perm[j] = tmp;
+        }
+        return perm;
+    }
+
     // =========================================================================
-    // BÚSQUEDA GOLOSA ITERATIVA — 3 NIVELES (FASE 2)
+    // BÚSQUEDA GREEDY ITERATIVA — 3 NIVELES (FASE 2)
     //
-    // Estrategia equivalente al ALNS del equipo rival, pero con validación REAL
-    // de capacidad (CAS atómico). El ALNS omite esta validación y "hace trampa";
-    // nosotros la incluimos porque la corrección es no negociable.
+    // Asigna al envío la primera ruta factible encontrada, evaluando vuelos
+    // en el orden en que aparecen en el array tablero.vueloOrigen[].
     //
-    // Política de reserva:
-    //   Nivel 1: reservar v1 → éxito o próximo v1.
-    //   Nivel 2: reservar v1, luego iterar v2; liberar v1 si ningún v2 funciona.
-    //   Nivel 3: análogo con 3 vuelos, libera en cascada al fallar.
+    // La "greedy" aquí significa: primer vuelo que cabe, no el más barato.
+    // Esta decisión es intencional: en la Fase 2 se busca velocidad (O(V³)
+    // sin backtracking). La calidad de la solución se mejora en la Fase 3.
     //
-    // Sin backtracking entre niveles: si el nivel N falla, avanza al nivel N+1
-    // (el DFS lo manejaría la Fase 3).
+    // Política de reserva de capacidad (lock-free):
+    //   Nivel 1: intentar reservar v1 → si ok, éxito; si no, probar siguiente v1.
+    //   Nivel 2: reservar v1, luego iterar v2; si ningún v2 cabe → liberar v1.
+    //   Nivel 3: reservar v1, reservar v2, iterar v3; libera en cascada al fallar.
+    //
+    // Si ningún nivel encuentra ruta → el envío queda rechazado (Fase 3).
     // =========================================================================
+
+    /**
+     * Busca y reserva la primera ruta factible para un envío.
+     *
+     * <p>Evalúa tres niveles en orden:
+     * <ol>
+     *   <li><b>Nivel 1</b> — Vuelo directo: origen → destino (1 tramo).</li>
+     *   <li><b>Nivel 2</b> — 1 escala: origen → escala → destino (2 tramos).</li>
+     *   <li><b>Nivel 3</b> — 2 escalas: origen → e1 → e2 → destino (3 tramos).</li>
+     * </ol>
+     *
+     * <p>En cada nivel, la capacidad se reserva atómicamente (CAS). Si un
+     * vuelo intermedio no puede ser completado, su espacio se libera antes
+     * de intentar la siguiente combinación.
+     *
+     * @param origen    ID del aeropuerto de origen del envío.
+     * @param destino   ID del aeropuerto de destino del envío.
+     * @param maletas   Número de maletas del envío (demanda de capacidad).
+     * @param tRegistro Minuto UTC absoluto desde el que el envío está disponible.
+     * @param deadline  Minuto UTC absoluto límite de llegada al destino.
+     * @param rutaOut   Array de salida: índices de vuelo por tramo (se rellena si éxito).
+     * @param diasOut   Array de salida: minutos UTC absolutos de salida por tramo.
+     * @return {@code true} si se encontró y reservó una ruta factible.
+     */
     private boolean buscarRutaGreedy(int origen, int destino, int maletas,
                                      long tRegistro, long deadline,
                                      int[] rutaOut, long[] diasOut) {
@@ -268,15 +444,37 @@ public class PlanificadorGVNSConcurrente {
         return false; // Sin ruta en ninguno de los 3 niveles → envío rechazado
     }
 
-    /** Duración de vuelo en minutos, ajustada si cruza medianoche. */
+    /**
+     * Calcula la duración del vuelo v en minutos, corrigiendo si la llegada
+     * es al día siguiente (llegada UTC &lt; salida UTC → el vuelo cruza medianoche).
+     */
     private long duracionVuelo(int v) {
         long dur = tablero.vueloLlegadaUTC[v] - tablero.vueloSalidaUTC[v];
         return (dur < 0) ? dur + 1440 : dur;
     }
 
     // =========================================================================
-    // CONTROL DE CAPACIDAD ATÓMICO Y LOCK-FREE — SIN CAMBIOS
+    // CONTROL DE CAPACIDAD — LOCK-FREE CON CAS (Compare-And-Set)
+    //
+    // El mapa ocupacionVuelos asocia a cada vuelo-día el número de maletas
+    // ya reservadas. Las operaciones de reserva y liberación son atómicas:
+    // ningún hilo puede reservar más allá de la capacidad del vuelo.
+    //
+    // Se usa CAS en lugar de synchronized para evitar contención de mutex
+    // en escenarios con millones de envíos procesados en paralelo.
     // =========================================================================
+
+    /**
+     * Intenta reservar {@code maletas} asientos en el vuelo {@code v} para
+     * el día correspondiente a {@code salidaAbsoluta}.
+     *
+     * <p>Implementa un CAS loop: lee la ocupación actual, verifica que la
+     * suma no supere la capacidad, e intenta escribir atómicamente. Si otro
+     * hilo modifica el contador antes del CAS, reintenta.
+     *
+     * @return {@code true} si la reserva fue exitosa; {@code false} si no hay
+     *         capacidad disponible.
+     */
     private boolean intentarReservarEspacio(int v, long salidaAbsoluta, int maletas) {
         long key = claveVueloDia(v, salidaAbsoluta);
         ocupacionVuelos.putIfAbsent(key, new AtomicInteger(0));
@@ -285,22 +483,77 @@ public class PlanificadorGVNSConcurrente {
             int actual = ocu.get();
             if (actual + maletas > tablero.vueloCapacidad[v]) return false;
             if (ocu.compareAndSet(actual, actual + maletas))  return true;
+            // CAS falló: otro hilo modificó el contador; reintentar.
         }
     }
 
+    /**
+     * Libera {@code maletas} asientos previamente reservados en el vuelo {@code v}.
+     * Se llama cuando una ruta parcial no puede completarse (rollback de capacidad).
+     */
     private void liberarEspacio(int v, long salidaAbsoluta, int maletas) {
         AtomicInteger ocu = ocupacionVuelos.get(claveVueloDia(v, salidaAbsoluta));
         if (ocu != null) ocu.addAndGet(-maletas);
     }
 
-    /** Clave única vuelo-día para el mapa de ocupación. */
+    /**
+     * Genera la clave única para identificar un vuelo en un día específico.
+     *
+     * <p>Fórmula: {@code v * 100_000 + diaAbsoluto}, donde diaAbsoluto =
+     * salidaAbsoluta / 1440. Permite que el mismo vuelo (vuelo v) tenga
+     * ocupaciones distintas en días distintos (vuelo repetido en el schedule).
+     */
     private static long claveVueloDia(int v, long salidaAbsoluta) {
         return v * 100_000L + (salidaAbsoluta / 1440);
     }
 
+    /**
+     * Calcula el minuto UTC absoluto de salida del vuelo, dado el minuto actual.
+     *
+     * <p>Si el vuelo sale más tarde en el mismo día: usamos ese horario.
+     * Si el vuelo ya pasó hoy: usamos el horario del día siguiente (+1440 min).
+     * Esto modela vuelos con horario fijo que operan diariamente.
+     *
+     * @param minutoActualAbsoluto minuto UTC desde el que el envío está disponible.
+     * @param salidaVueloUTC       minuto del día UTC en que sale el vuelo (0-1439).
+     * @return minuto UTC absoluto de la próxima salida factible del vuelo.
+     */
+    private long calcularMinutoSalidaReal(long minutoActualAbsoluto, long salidaVueloUTC) {
+        long minDelDia  = minutoActualAbsoluto % 1440;
+        long diaAbs     = minutoActualAbsoluto / 1440;
+        return (minDelDia <= salidaVueloUTC)
+                ? diaAbs * 1440 + salidaVueloUTC
+                : (diaAbs + 1) * 1440 + salidaVueloUTC;
+    }
+
     // =========================================================================
     // MOTOR DFS — EXCLUSIVO PARA FASE 3 (VND N1/N2)
+    //
+    // A diferencia de buscarRutaGreedy(), este DFS explora TODAS las rutas
+    // posibles con backtracking. Es más lento (O(V^MAX_SALTOS) worst-case)
+    // pero encuentra rutas que el greedy pierde por no retroceder.
+    // Se usa en VND N1 (Relocate) y VND N2 (Exchange) donde la calidad de la
+    // exploración justifica el costo adicional por envío rechazado.
     // =========================================================================
+
+    /**
+     * Búsqueda en profundidad (DFS) con backtracking para encontrar una ruta
+     * desde {@code nodoActual} hasta {@code destinoFinal}.
+     *
+     * <p>Reserva capacidad en cada tramo; si la rama falla, libera y retrocede.
+     * Llama recursivamente incrementando {@code saltoActual} hasta alcanzar
+     * el destino o agotar {@code MAX_SALTOS}.
+     *
+     * @param nodoActual      aeropuerto desde el que se busca el siguiente vuelo.
+     * @param destinoFinal    aeropuerto objetivo.
+     * @param maletas         maletas a transportar (demanda de capacidad).
+     * @param tiempoActual    minuto UTC absoluto más temprano para la salida.
+     * @param deadline        minuto UTC absoluto límite de llegada.
+     * @param saltoActual     profundidad actual en la recursión (0-indexed).
+     * @param rutaTempVuelos  array de salida para índices de vuelo.
+     * @param rutaTempDias    array de salida para minutos UTC de salida.
+     * @return {@code true} si se encontró una ruta factible completa.
+     */
     private boolean buscarRutaDFS(int nodoActual, int destinoFinal, int maletas,
                                   long tiempoActual, long deadline, int saltoActual,
                                   int[] rutaTempVuelos, long[] rutaTempDias) {
@@ -330,18 +583,18 @@ public class PlanificadorGVNSConcurrente {
         return false;
     }
 
-    private long calcularMinutoSalidaReal(long minutoActualAbsoluto, long salidaVueloUTC) {
-        long minDelDia  = minutoActualAbsoluto % 1440;
-        long diaAbs     = minutoActualAbsoluto / 1440;
-        return (minDelDia <= salidaVueloUTC)
-                ? diaAbs * 1440 + salidaVueloUTC
-                : (diaAbs + 1) * 1440 + salidaVueloUTC;
-    }
-
     // =========================================================================
-    // FASE 3: GVNS FORMAL — POLAT ET AL. (2026) — SIN CAMBIOS ESTRUCTURALES
+    // FASE 3: GVNS — CICLO METAHEURÍSTICO (Polat et al. 2026, §3.2)
+    //
+    // Estructura VNS estándar aplicada al problema de re-inserción de rechazados:
+    //   - Función objetivo f(x) = número de envíos en el pool de rechazados.
+    //   - Shaking:    expulsar k*BATCH envíos asignados → ampliar espacio de búsqueda.
+    //   - VND N1:     re-insertar rechazados con DFS (Relocate).
+    //   - VND N2:     liberar temporalmente un vuelo, re-insertar con DFS (Exchange).
+    //   - Aceptación: si f(x) mejora → k=1; si no → revertir y k = (k%K_MAX)+1.
     // =========================================================================
 
+    /** Cuenta los envíos activamente rechazados (ignora posiciones -1 ya salvadas). */
     private int contarRechazadosActivos() {
         int count = 0;
         for (int i = 0; i < totalRechazados; i++)
@@ -349,12 +602,30 @@ public class PlanificadorGVNSConcurrente {
         return count;
     }
 
+    /** Marca el envío {@code idEnvio} como salvado en el pool (pone -1 en su posición). */
     private void eliminarDeRechazados(int idEnvio) {
         for (int i = 0; i < totalRechazados; i++) {
             if (enviosRechazados[i] == idEnvio) { enviosRechazados[i] = -1; return; }
         }
     }
 
+    /**
+     * Ejecuta el ciclo de mejora GVNS sobre el pool de rechazados de la Fase 2.
+     *
+     * <p>Implementa el pseudocódigo de Polat et al. (2026) Fig. 2:
+     * <pre>
+     *   k ← 1
+     *   while tiempo_disponible AND f(x) &gt; 0:
+     *     x' ← Shaking(x, k)        // perturbar solución actual
+     *     x'' ← VND(x')             // búsqueda de descenso variable
+     *     if f(x'') &lt; f(x):         // criterio de aceptación
+     *       x ← x''; k ← 1
+     *     else:
+     *       revertir; k ← (k % K_MAX) + 1
+     * </pre>
+     *
+     * @return número total de envíos salvados (rechazados que recibieron ruta).
+     */
     public int ejecutarMejoraGVNS() {
         System.out.println("GVNS FORMAL: Iniciando ciclo metaheuristico (Polat et al., 2026)...");
 
@@ -413,7 +684,22 @@ public class PlanificadorGVNSConcurrente {
         return totalSalvados;
     }
 
-    // ── SHAKING ───────────────────────────────────────────────────────────────
+    // ── SHAKING (Polat et al. §3.9.2 — Perturbation) ─────────────────────────
+
+    /**
+     * Expulsa {@code n} envíos asignados de la solución y los devuelve al pool
+     * de rechazados, guardando snapshot de sus rutas para posible reversión.
+     *
+     * <p>La selección de envíos a expulsar usa un generador LCG (Lehmer) para
+     * distribuirlos aleatoriamente en el array de solución. El stride evita
+     * concentrar todos los expulsados en el mismo rango de índices.
+     *
+     * @param n              número de envíos a expulsar.
+     * @param idsExpulsados  array de salida: IDs de los envíos expulsados.
+     * @param rutasExpulsadas array de salida: snapshot de rutas (para revertir).
+     * @param diasExpulsados  array de salida: snapshot de días de salida.
+     * @return número real de envíos expulsados (puede ser &lt; n si no hay suficientes).
+     */
     private int ejecutarShaking(int n,
                                 int[]    idsExpulsados,
                                 int[][]  rutasExpulsadas,
@@ -448,6 +734,16 @@ public class PlanificadorGVNSConcurrente {
     }
 
     // ── REVERSIÓN DEL SHAKING ─────────────────────────────────────────────────
+
+    /**
+     * Restaura los envíos expulsados por {@link #ejecutarShaking} a su estado
+     * anterior (si la iteración GVNS no produjo mejora).
+     *
+     * <p>Para cada envío expulsado: intenta re-reservar su ruta original.
+     * Si la re-reserva falla (otro envío tomó esa capacidad durante el VND),
+     * el envío queda en el pool de rechazados (comportamiento aceptable:
+     * el VND ya encontró al menos una alternativa).
+     */
     private void revertirShaking(int[]    idsExpulsados,
                                  int[][]  rutasExpulsadas,
                                  long[][] diasExpulsados,
@@ -491,7 +787,18 @@ public class PlanificadorGVNSConcurrente {
         }
     }
 
-    // ── VND N1: Relocate ──────────────────────────────────────────────────────
+    // ── VND N1: Relocate (Polat et al. §3.6 — Best Insert adaptado) ──────────
+
+    /**
+     * Vecindad N1 — Relocate: intenta insertar cada envío rechazado en la red
+     * buscando cualquier ruta factible mediante DFS.
+     *
+     * <p>Equivale al operador "Best Insert" del paper pero sin evaluar todas las
+     * posiciones: simplemente busca la primera ruta factible (DFS).
+     * Ejecutado en paralelo sobre el pool de rechazados.
+     *
+     * @return número de envíos salvados en esta pasada.
+     */
     private int aplicarVND_N1_Relocate() {
         AtomicInteger salvados = new AtomicInteger(0);
 
@@ -525,7 +832,19 @@ public class PlanificadorGVNSConcurrente {
         return salvados.get();
     }
 
-    // ── VND N2: Exchange virtual ──────────────────────────────────────────────
+    // ── VND N2: Exchange (Polat et al. §3.7 — 1-1 Exchange adaptado) ─────────
+
+    /**
+     * Vecindad N2 — Exchange: para cada envío rechazado, busca un vuelo directo
+     * que esté lleno, libera temporalmente su capacidad, intenta insertar el
+     * rechazado via DFS, y restaura la capacidad original.
+     *
+     * <p>Modela el intercambio de Shift Operator del paper: un envío cede su
+     * lugar para que otro pueda ocuparlo, ampliando el espacio de búsqueda
+     * más allá de lo que N1 puede alcanzar.
+     *
+     * @return número de envíos salvados en esta pasada.
+     */
     private int aplicarVND_N2_Exchange() {
         AtomicInteger salvados = new AtomicInteger(0);
 
@@ -590,8 +909,20 @@ public class PlanificadorGVNSConcurrente {
     }
 
     // =========================================================================
-    // EXPORTACIÓN CSV DE MÉTRICAS — SIN CAMBIOS
+    // EXPORTACIÓN CSV DE MÉTRICAS
     // =========================================================================
+
+    /**
+     * Exporta métricas de la ejecución completa (Fase 2 + Fase 3) a un archivo CSV.
+     *
+     * <p>Columnas: Total Envíos, Exitosos, Rechazados iniciales, Salvados por GVNS,
+     * Rechazados finales, tiempos de CPU y tasa de éxito final.
+     *
+     * @param nombreArchivo ruta del archivo CSV de salida.
+     * @param tiempoGreedy  segundos de CPU invertidos en la Fase 2.
+     * @param tiempoGVNS    segundos de CPU invertidos en la Fase 3.
+     * @param salvadosGVNS  envíos recuperados por N1+N2 en la Fase 3.
+     */
     public void exportarResultadosCSV(String nombreArchivo,
                                       double tiempoGreedy,
                                       double tiempoGVNS,
