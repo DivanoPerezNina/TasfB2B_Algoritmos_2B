@@ -226,6 +226,8 @@ public class PlanificadorGVNSConcurrente {
 
             int[]  rutaTemp = new int [MAX_SALTOS];
             long[] diasTemp = new long[MAX_SALTOS];
+            Arrays.fill(rutaTemp, -1);   // crítico: Java inicializa a 0, no a -1
+            Arrays.fill(diasTemp, -1L);  // vuelo 0 existe, así que 0 ≠ "sin tramo"
 
             // Buscar y reservar la primera ruta factible (greedy, sin backtracking).
             boolean encontroRuta = buscarRutaGreedy(
