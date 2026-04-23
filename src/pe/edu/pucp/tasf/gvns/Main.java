@@ -41,7 +41,11 @@ public class Main {
                     + (datos.envioDeadlineUTC[e] - datos.envioRegistroUTC[e]));
         }
 
-        // ── FASE 2: Solución inicial golosa (multihilo) ───────────────────────
+        // ── Análisis de cobertura del grafo antes de resolver ─────────────────
+        System.out.println("\n--- ANALISIS DE RED ---");
+        AnalizadorRed.analizarCobertura(datos);
+
+        // ── FASE 2: Construcción de solución inicial — mínimo tránsito ────────
         System.out.println("\n--- FASE 2: SOLUCION INICIAL (MULTIHILO) ---");
         PlanificadorGVNSConcurrente plan = new PlanificadorGVNSConcurrente(datos);
 
@@ -51,6 +55,13 @@ public class Main {
         double tiempoGreedy = (tiempoFin - tiempoInicio) / 1000.0;
         System.out.printf("Tiempo de CPU de la Solucion Inicial: %.2f segundos%n", tiempoGreedy);
 
+        // Capturar f(x) antes de GVNS para la tabla comparativa
+        long fGreedy = plan.calcularTransitoTotal();
+        System.out.printf("Transito total Fase 2: %,d min%n", fGreedy);
+
+        // Distribución de tramos en la solución inicial
+        AnalizadorRed.analizarSolucion(datos, plan.solucionVuelos);
+
         // ── FASE 3: Optimización GVNS ─────────────────────────────────────────
         System.out.println("\n--- FASE 3: OPTIMIZACION GVNS ---");
         long inicioGVNS = System.currentTimeMillis();
@@ -59,9 +70,13 @@ public class Main {
         double tiempoGVNS = (finGVNS - inicioGVNS) / 1000.0;
         System.out.printf("Tiempo de CPU GVNS: %.2f segundos%n", tiempoGVNS);
 
+        // Tabla comparativa Fase 2 vs Fase 3
+        long fGVNS = plan.calcularTransitoTotal();
+        AnalizadorRed.compararFases(fGreedy, fGVNS, salvados);
+
         // ── Exportar métricas CSV ─────────────────────────────────────────────
         plan.exportarResultadosCSV("resultados_escenario_concurrente.csv",
-                tiempoGreedy, tiempoGVNS, salvados);
+                fGreedy, tiempoGreedy, tiempoGVNS, salvados);
 
         // ── AUDITORÍA MATEMÁTICA de la solución ───────────────────────────────
         System.out.println("\n--- AUDITORIA DE SOLUCION ---");
