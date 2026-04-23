@@ -162,7 +162,9 @@ public class PlanificadorGVNSConcurrente {
         Arrays.fill(muestraGVNS,  -1);
 
         // Construir índice de adyacencia: vuelosPorOrigen[a] → vuelos que salen de a
-        int A = datos.numAeropuertos;
+        // Los IDs de aeropuerto son 1-based (1..numAeropuertos), así que el array
+        // necesita tamaño numAeropuertos+1 para que el índice más alto sea válido.
+        int A = datos.numAeropuertos + 1;
         int[] conteo = new int[A];
         for (int v = 0; v < datos.numVuelos; v++) conteo[datos.vueloOrigen[v]]++;
         this.vuelosPorOrigen = new int[A][];

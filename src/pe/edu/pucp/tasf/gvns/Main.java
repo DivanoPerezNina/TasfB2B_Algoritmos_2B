@@ -86,6 +86,17 @@ public class Main {
                 plan.solucionDias,
                 plan.ocupacionVuelos);
 
+        // ── [OPCIONAL] SIMULACIÓN DE CANCELACIÓN DE VUELO ────────────────────
+        // Descomenta este bloque para probar la replanificación en tiempo real.
+        // Cambia el índice (0) por el ID del vuelo que quieres cancelar.
+        // Puedes ver los IDs disponibles en la sección "PRUEBA DE ARISTAS" arriba.
+        //
+        // int vueloCancelado = 0;
+        // System.out.println("\n--- SIMULACION CANCELACION ---");
+        // plan.replanificarVueloCancelado(vueloCancelado);
+        // AuditorRutas.auditarSolucion(datos, plan.solucionVuelos,
+        //         plan.solucionDias, plan.ocupacionVuelos);
+
         // ── EXPORTACIÓN JSON para frontend React/Vue ──────────────────────────
         System.out.println("\n--- EXPORTACION VISUAL ---");
         int enviosRuteados   = plan.enviosExitosos.get();
