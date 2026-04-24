@@ -180,7 +180,37 @@ public class GestorDatos {
     //  2. Conversión UTC sin LocalDateTime: método estático calcularEpochMinutos()
     //     evita ~9.5 M asignaciones de objetos LocalDateTime + LocalDateTime en Heap.
     // =========================================================================
+    /**
+     * Descarta todos los envíos cargados para reutilizar los arrays en una nueva
+     * ventana de simulación. No libera memoria (los arrays siguen en heap).
+     * Llamar antes de {@link #cargarTodosLosEnvios} en el escenario COLAPSO.
+     */
+    public void resetEnvios() {
+        numEnvios = 0;
+    }
+
+    /**
+     * Carga todos los envíos de {@code rutaDirectorio} sin filtro de tiempo.
+     * Equivale a {@code cargarTodosLosEnvios(ruta, Long.MIN_VALUE, Long.MAX_VALUE)}.
+     *
+     * @param rutaDirectorio carpeta con archivos {@code _envios_IATA_.txt}
+     */
     public void cargarTodosLosEnvios(String rutaDirectorio) {
+        cargarTodosLosEnvios(rutaDirectorio, Long.MIN_VALUE, Long.MAX_VALUE);
+    }
+
+    /**
+     * Carga solo los envíos cuyo {@code envioRegistroUTC} cae en
+     * {@code [inicioUTC, finUTC)}, permitiendo filtrar por ventana de simulación.
+     *
+     * <p>Usado por los escenarios de período y colapso para restringir la carga
+     * a los días relevantes sin necesidad de archivos separados por día.
+     *
+     * @param rutaDirectorio carpeta con archivos {@code _envios_IATA_.txt}
+     * @param inicioUTC      minuto UTC absoluto de inicio (inclusive)
+     * @param finUTC         minuto UTC absoluto de fin (exclusive)
+     */
+    public void cargarTodosLosEnvios(String rutaDirectorio, long inicioUTC, long finUTC) {
         File carpeta = new File(rutaDirectorio);
         if (!carpeta.isDirectory()) {
             System.err.println("La ruta de envios no es una carpeta: " + rutaDirectorio);
@@ -192,7 +222,7 @@ public class GestorDatos {
             for (File archivo : archivos) {
                 if (archivo.getName().startsWith("_envios_") && archivo.getName().endsWith(".txt")) {
                     System.out.println("Procesando " + archivo.getName() + "...");
-                    cargarArchivoEnvio(archivo);
+                    cargarArchivoEnvio(archivo, inicioUTC, finUTC);
                 }
             }
         }
@@ -209,7 +239,7 @@ public class GestorDatos {
      * mediante aritmética pura de enteros (ver calcularEpochMinutos), eliminando
      * la creación de objetos LocalDateTime que saturaban el GC en la carga masiva.
      */
-    private void cargarArchivoEnvio(File archivo) {
+    private void cargarArchivoEnvio(File archivo, long inicioUTC, long finUTC) {
         // Extraer IATA de origen del nombre del archivo: _envios_OAKB_.txt → OAKB
         String nombre    = archivo.getName();
         String iataOrigen= nombre.replace("_envios_", "").replace("_.txt", "").trim();
@@ -255,6 +285,9 @@ public class GestorDatos {
                     System.err.println("LIMITE ALCANZADO: mas de 20 millones de envios.");
                     break;
                 }
+
+                // Filtro de ventana temporal: solo cargar si el registro cae en [inicioUTC, finUTC)
+                if (minutosUTC < inicioUTC || minutosUTC >= finUTC) continue;
 
                 envioOrigen    [numEnvios] = idOrigen;
                 envioDestino   [numEnvios] = idDestino;

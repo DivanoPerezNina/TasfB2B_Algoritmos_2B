@@ -78,26 +78,34 @@ public final class ExportadorVisual {
             sb.append("    \"vuelos\":            ").append(datos.numVuelos).append("\n");
             sb.append("  },\n");
 
-            // ── Sección fase2 (100 muestras) ─────────────────────────────────
-            int n2 = plan.cantMuestraFase2();
+            // ── Sección fase2 (hasta 100 muestras con ruta activa) ───────────
+            // Se filtra al exportar porque el Shaking de Fase 3 puede haber
+            // expulsado envíos que estaban en la muestra sin poder reinsertar su ruta.
             sb.append("  \"fase2\": [\n");
+            int n2 = plan.cantMuestraFase2();
+            boolean primeraFase2 = true;
             for (int i = 0; i < n2; i++) {
                 int e = plan.muestraFase2[i];
+                if (plan.solucionVuelos[e][0] == -1) continue; // sin ruta al exportar
+                if (!primeraFase2) sb.append(',').append('\n');
                 appendEnvio(sb, e, plan, datos);
-                if (i < n2 - 1) sb.append(',');
-                sb.append('\n');
+                primeraFase2 = false;
             }
+            if (!primeraFase2) sb.append('\n');
             sb.append("  ],\n");
 
-            // ── Sección gvns (10 muestras) ────────────────────────────────────
-            int ng = plan.cantMuestraGVNS();
+            // ── Sección gvns (hasta 10 muestras con ruta activa) ─────────────
             sb.append("  \"gvns\": [\n");
+            int ng = plan.cantMuestraGVNS();
+            boolean primeraGVNS = true;
             for (int i = 0; i < ng; i++) {
                 int e = plan.muestraGVNS[i];
+                if (plan.solucionVuelos[e][0] == -1) continue;
+                if (!primeraGVNS) sb.append(',').append('\n');
                 appendEnvio(sb, e, plan, datos);
-                if (i < ng - 1) sb.append(',');
-                sb.append('\n');
+                primeraGVNS = false;
             }
+            if (!primeraGVNS) sb.append('\n');
             sb.append("  ]\n");
 
             sb.append("}\n");
