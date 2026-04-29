@@ -294,9 +294,8 @@ public class GestorDatos {
                 envioMaletas   [numEnvios] = cantMaletas;
                 envioRegistroUTC[numEnvios]= minutosUTC;
 
-                // Deadline: mismo continente → 24 h (1440 min), distinto → 48 h (2880 min)
-                boolean mismoContinente = (continenteAero[idOrigen] == continenteAero[idDestino]);
-                envioDeadlineUTC[numEnvios] = minutosUTC + (mismoContinente ? 1440L : 2880L);
+                envioDeadlineUTC[numEnvios] = calcularDeadline(minutosUTC,
+                        continenteAero[idOrigen], continenteAero[idDestino]);
 
                 numEnvios++;
 
@@ -318,7 +317,8 @@ public class GestorDatos {
     // Verificación para 2025-08-18 10:30 local GMT+2 (→ 08:30 UTC):
     //   JDN(2025-08-18) = 2 460 906
     //   EpochDay        = 2 460 906 − 2 440 588 = 20 318
-    //   minutosUTC      = 20 318 × 1440 + 8×60 + 30 − 0 = 29 258 190
+    //   minutosLocales  = 20 318 × 1440 + 10×60 + 30 = 29 258 550
+    //   minutosUTC      = 29 258 550 − 2×60 = 29 258 430
     // =========================================================================
     /**
      * Convierte una fecha/hora local a minutos absolutos UTC desde Epoch
@@ -332,6 +332,15 @@ public class GestorDatos {
      * @param gmtHoras offset UTC del aeropuerto de origen (ej. +2 o -5)
      * @return minutos desde Epoch (1970-01-01 00:00 UTC)
      */
+    /**
+     * Deadline de entrega según regla de continentes:
+     *   mismo continente → registro + 1440 min (24 h)
+     *   distinto continente → registro + 2880 min (48 h)
+     */
+    static long calcularDeadline(long registroUTC, int continenteOrigen, int continenteDestino) {
+        return registroUTC + (continenteOrigen == continenteDestino ? 1440L : 2880L);
+    }
+
     public static long calcularEpochMinutos(int anio, int mes, int dia,
                                             int horaLoc, int minLoc, int gmtHoras) {
         // Paso 1: Número de Día Juliano (JDN) de la fecha gregoriana

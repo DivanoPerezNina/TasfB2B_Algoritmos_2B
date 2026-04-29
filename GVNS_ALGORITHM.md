@@ -71,7 +71,7 @@ Implementa el ciclo VNS estándar con tiempo límite de 120 segundos:
 
 ```
 k ← 1
-mientras tiempo_disponible Y f(x) > 0:
+mientras tiempo_disponible:
     Shaking: expulsar k×BATCH envíos asignados → aumentar espacio de búsqueda
     VND N1 (Relocate): re-insertar rechazados con DFS
     VND N2 (Exchange):  liberar un vuelo lleno temporalmente, reintentar DFS
@@ -79,7 +79,19 @@ mientras tiempo_disponible Y f(x) > 0:
     si no:     revertir shaking; k ← (k % K_MAX) + 1
 ```
 
-La función objetivo es: `f(x) = número de envíos en el pool de rechazados`.
+**Función objetivo:**
+
+```
+f(x) = rechazados_activos × 2880 + tránsito_total
+```
+
+| Término | Descripción |
+|---|---|
+| `rechazados_activos` | Envíos en el pool sin ruta (sin contar posiciones `-1` ya salvadas) |
+| `tránsito_total` | Suma de `(llegada_destino_UTC − registroUTC)` de todos los envíos asignados |
+| `2880` | Penalización = deadline máximo posible (distinto continente, 48 h) |
+
+**Por qué la penalización es 2880:** garantiza que cualquier reducción de rechazados mejora `f`, sin importar el tránsito. Sin ella, si la Fase 2 ruteaba el 100 % de envíos (`rechazados = 0 → f = 0`), el GVNS arrancaba desde `f = 0` y rechazaba cualquier movimiento —incluso uno que redujera el tránsito— porque todo movimiento sube `f` desde cero. La penalización hace que `f` nunca empiece en 0 salvo cuando no hay envíos.
 
 ---
 

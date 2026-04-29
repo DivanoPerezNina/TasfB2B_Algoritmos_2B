@@ -239,6 +239,7 @@ public class Main {
         plan.exportarResultadosCSV(
                 "resultados_" + slug + ".csv",
                 fGreedy, tiempoGreedy, tiempoGVNS, salvados);
+        plan.exportarHistorialConvergenciaCSV("convergencia_" + slug + ".csv");
 
         // ── Auditoría matemática ──────────────────────────────────────────────
         System.out.println("\n--- AUDITORÍA DE SOLUCIÓN ---");
