@@ -162,9 +162,6 @@ public class Main {
         }
         datos.cargarVuelos(RUTA_VUELOS);
 
-        System.out.println("\n--- ANÁLISIS DE RED ---");
-        AnalizadorRed.analizarCobertura(datos);
-
         int  anio      = FECHA_INICIO_AAAAMMDD / 10000;
         int  mes       = (FECHA_INICIO_AAAAMMDD / 100) % 100;
         int  dia       = FECHA_INICIO_AAAAMMDD % 100;
@@ -180,6 +177,9 @@ public class Main {
             return;
         }
         System.out.printf("Envíos cargados: %,d%n", datos.numEnvios);
+
+        System.out.println("\n--- ANÁLISIS DE RED ---");
+        AnalizadorRed.analizarCobertura(datos);
 
         // ── Definición del lote: 7 configuraciones ────────────────────────────
         // FIFO×1 + EDF×1 + ALEATORIO×5 semillas
