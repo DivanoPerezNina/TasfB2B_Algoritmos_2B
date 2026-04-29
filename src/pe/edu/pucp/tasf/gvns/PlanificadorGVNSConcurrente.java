@@ -2,7 +2,9 @@ package pe.edu.pucp.tasf.gvns;
 
 import java.io.FileWriter;
 import java.io.PrintWriter;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -28,7 +30,7 @@ import java.util.stream.IntStream;
  *       encontrada por búsqueda greedy de 3 niveles (directo / 1 escala /
  *       2 escalas). Los no asignados van al pool de rechazados.
  *  Fase 3 — Mejora GVNS (§3.2):
- *    Loop hasta tiempo límite o f(x)=0:
+ *    Loop hasta tiempo límite:
  *      · Shaking:     expulsar k*batch envíos asignados → pool de rechazados.
  *      · VND N1:      intentar re-insertar rechazados vía DFS (Relocate).
  *      · VND N2:      liberar un vuelo temporalmente y re-insertar (Exchange).
@@ -74,8 +76,11 @@ public class PlanificadorGVNSConcurrente {
     public final int MAX_SALTOS           = 3;
 
     // ── PARÁMETROS GVNS (Polat et al. 2026, Tabla 3) ─────────────────────────
-    /** Tiempo de CPU máximo para la Fase 3 (ms). */
-    private static final long TIEMPO_LIMITE_MS = 120_000L;
+    /**
+     * Tiempo de CPU máximo para la Fase 3 (ms). Default: 120 s.
+     * Package-private para que los tests puedan reducirlo sin tocar producción.
+     */
+    long TIEMPO_LIMITE_MS = 120_000L;
     /** Número máximo de estructuras de vecindad (k_max en el paper). */
     private static final int  K_MAX            = 3;
     /** Envíos expulsados por iteración de Shaking en k=1 (escala con k). */
@@ -106,6 +111,14 @@ public class PlanificadorGVNSConcurrente {
     private final Object lockRechazados = new Object();
     /** Contador atómico de envíos con ruta asignada (Fase 2 + Fase 3). */
     public  AtomicInteger enviosExitosos = new AtomicInteger(0);
+
+    /**
+     * Historial de convergencia de la Fase 3.
+     * Cada entrada: long[] { iteracion, ms_transcurridos, mejor_fitness_hasta_ahora }.
+     * Poblado por ejecutarMejoraGVNS(); vacío si la Fase 3 no se ejecutó.
+     */
+    public final List<long[]> historialFitness = new ArrayList<>();
+
     /**
      * Mapa de ocupación de vuelos.
      * Clave: claveVueloDia(v, salidaAbsoluta) → vuelo v en el día de salidaAbsoluta.
@@ -678,9 +691,9 @@ public class PlanificadorGVNSConcurrente {
     // =========================================================================
     // FASE 3: GVNS — CICLO METAHEURÍSTICO (Polat et al. 2026, §3.2)
     //
-    // Función objetivo: f(x) = calcularTransitoTotal() en minutos.
-    //   Minimizar el tránsito total = suma de (llegada_destino - registro) de
-    //   todos los envíos asignados. Menor tránsito = maletas llegan antes.
+    // Función objetivo: f(x) = rechazados_activos × 2880 + tránsito_total
+    //   La penalización garantiza que reducir rechazados siempre mejora f,
+    //   independientemente del tránsito. Ver calcularFitnessTotal().
     //
     // La Fase 2 greedy asigna el PRIMER vuelo directo encontrado (no el mejor).
     // El GVNS mejora esto: expulsa envíos con peor tránsito y les busca rutas
@@ -696,7 +709,7 @@ public class PlanificadorGVNSConcurrente {
     // =========================================================================
 
     /** Cuenta los envíos activamente rechazados (ignora posiciones -1 ya salvadas). */
-    private int contarRechazadosActivos() {
+    int contarRechazadosActivos() {
         int count = 0;
         for (int i = 0; i < totalRechazados; i++)
             if (enviosRechazados[i] != -1) count++;
@@ -755,7 +768,7 @@ public class PlanificadorGVNSConcurrente {
      * el GVNS arrancaría con f=0 y rechazaría cualquier mejora (más rechazos =
      * más tránsito = f sube desde 0).
      */
-    private long calcularFitnessTotal() {
+    long calcularFitnessTotal() {
         final long PENALIZACION = 2880L; // minutos del máximo deadline (distinto continente)
         return (long) contarRechazadosActivos() * PENALIZACION + calcularTransitoTotal();
     }
@@ -830,6 +843,13 @@ public class PlanificadorGVNSConcurrente {
                     System.out.printf("  [Iter %4d] sin mejora | f(x)=%,d | rec=%d | k=%d%n",
                             iterTotal, nuevoFitness, contarRechazadosActivos(), k);
             }
+
+            // Registrar mejor fitness conocido al cierre de cada iteración
+            historialFitness.add(new long[]{
+                iterTotal,
+                System.currentTimeMillis() - tiempoInicio,
+                mejorFitness
+            });
         }
 
         long tTotal = System.currentTimeMillis() - tiempoInicio;
@@ -1544,6 +1564,27 @@ public class PlanificadorGVNSConcurrente {
             System.out.println("Resultados exportados: " + nombreArchivo);
         } catch (Exception ex) {
             System.err.println("Error al exportar CSV: " + ex.getMessage());
+        }
+    }
+
+    /**
+     * Exporta el historial de convergencia de la Fase 3 a un archivo CSV.
+     *
+     * <p>Columnas: {@code iteracion,ms_transcurridos,mejor_fitness}
+     * Cada fila es el mejor f(x) conocido al cierre de esa iteración.
+     * El archivo queda vacío si la Fase 3 no se ejecutó.
+     *
+     * @param nombreArchivo ruta del CSV a escribir (ej. "convergencia_3d.csv")
+     */
+    public void exportarHistorialConvergenciaCSV(String nombreArchivo) {
+        try (PrintWriter pw = new PrintWriter(new FileWriter(nombreArchivo))) {
+            pw.println("iteracion,ms_transcurridos,mejor_fitness");
+            for (long[] entrada : historialFitness) {
+                pw.printf("%d,%d,%d%n", entrada[0], entrada[1], entrada[2]);
+            }
+            System.out.println("Historial de convergencia exportado: " + nombreArchivo);
+        } catch (Exception ex) {
+            System.err.println("Error al exportar historial: " + ex.getMessage());
         }
     }
 

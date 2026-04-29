@@ -134,7 +134,7 @@ Motor principal. Contiene la Fase 2 (construcción) y la Fase 3 (GVNS).
 | Método | Qué hace |
 |---|---|
 | `construirSolucionInicial()` | **Fase 2.** Ordena los envíos según `CRITERIO_ORDEN`, luego los procesa en paralelo (`IntStream.parallel`). Para cada envío busca la primera ruta factible (directo / 1 escala / 2 escalas) y reserva capacidad atómicamente. |
-| `ejecutarMejoraGVNS()` | **Fase 3.** Loop VNS hasta el tiempo límite (120 s). Cada iteración: Shaking (expulsa los `k×BATCH` envíos de mayor tránsito) → VND N1 (re-insertar con mínimo tránsito) → VND N2 (Exchange). Acepta si mejora `f(x) = tránsito total`. |
+| `ejecutarMejoraGVNS()` | **Fase 3.** Loop VNS hasta el tiempo límite (120 s). Cada iteración: Shaking (expulsa los `k×BATCH` envíos de mayor tránsito) → VND N1 (re-insertar con mínimo tránsito) → VND N2 (Exchange). Acepta si mejora `f(x) = rechazados×2880 + tránsito_total`. |
 | `calcularTransitoTotal()` | Suma `(llegada_destino − registro)` de todos los envíos asignados. Métrica de calidad: menor es mejor. |
 | `replanificarVueloCancelado(int vueloId)` | Marca el vuelo como inoperable (capacidad=0), libera todos los envíos afectados y los re-enruta. |
 | `exportarResultadosCSV(...)` | Escribe métricas de la ejecución en un archivo CSV. |
@@ -216,6 +216,8 @@ Enum con los criterios de ordenamiento de envíos: `ALEATORIO` (Fisher-Yates), `
 | `BATCH_FACTOR` | `PlanificadorGVNSConcurrente` | `20` | Base de envíos expulsados por Shaking |
 | `TIEMPO_MINIMO_ESCALA` | `PlanificadorGVNSConcurrente` | `10` | Tiempo mínimo entre llegada y siguiente salida (min) |
 | `MAX_SALTOS` | `PlanificadorGVNSConcurrente` | `3` | Máximo de tramos por ruta |
+
+> **Nota sobre `PENALIZACION = 2880`:** este valor no es configurable. Debe ser ≥ al tránsito máximo posible de un envío. El máximo tránsito es el deadline de distinto continente (48 h = 2880 min), por lo que la penalización está fijada a ese valor para garantizar el ordenamiento lexicográfico `rechazados ≻ tránsito`.
 
 ---
 
