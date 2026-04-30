@@ -206,9 +206,10 @@ public class Main {
         System.out.println("\n--- ESTRANGULAMIENTO DE RED ---");
         int[] backupCapacidades = datos.respaldarYEstrangularVuelos(CAP_ESTRANGULAMIENTO);
 
-        // ── 5. Niveles de inyección (porcentaje del día pico) ─────────────────
-        double[] multiplicadores = {0.70, 0.85, 1.00, 1.15, 1.30};
-        String[] etiquetasNivel  = {"-30%", "-15%", "Pico", "+15%", "+30%"};
+        // ── 5. Niveles de inyección: desde el pico hacia arriba ──────────────
+        // Los envíos extra (>100%) vienen de los días 2-3 ya cargados en RAM.
+        double[] multiplicadores = {1.00, 1.15, 1.30, 1.50, 2.00};
+        String[] etiquetasNivel  = {"Pico", "+15%", "+30%", "+50%", "+100%"};
 
         // ── 6. Criterios a evaluar ────────────────────────────────────────────
         CriterioOrden[] criterios    = {CriterioOrden.FIFO, CriterioOrden.EDF, CriterioOrden.ALEATORIO};
