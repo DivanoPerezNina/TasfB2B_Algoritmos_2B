@@ -27,8 +27,11 @@ public class MainALNS {
     /** Tiempo límite del ALNS en el modo colapso (ms). */
     private static final long TIEMPO_LIMITE_COLAPSO_MS = 30_000L;
 
+    /** Semillas fijas para las réplicas independientes. */
+    private static final long[] SEMILLAS = {42L, 12345L, 99999L, 7777L, 31415L};
+
     /** Número de réplicas independientes por escenario. */
-    private static final int NUM_REPLICAS = 15;
+    private static final int NUM_REPLICAS = SEMILLAS.length;
 
     public static void main(String[] args) throws IOException {
         if (MODO_EXPNUM_ALNS) {
@@ -521,7 +524,8 @@ public class MainALNS {
 
         // 5. Bucle de réplicas con semillas 1-15
         for (int rep = 1; rep <= NUM_REPLICAS; rep++) {
-            System.out.printf("%n--- Réplica %d/%d (semilla=%d) ---%n", rep, NUM_REPLICAS, rep);
+            long semilla = SEMILLAS[rep - 1];
+            System.out.printf("%n--- Réplica %d/%d (semilla=%d) ---%n", rep, NUM_REPLICAS, semilla);
 
             ActiveShipmentPool pool = new ActiveShipmentPool(envios.size() + 1000);
             RouteStore routes = new RouteStore(envios.size() + 1000);
@@ -535,7 +539,7 @@ public class MainALNS {
             for (int i = 0; i < pool.getSize(); i++) criticos.add(i);
 
             long t0 = System.currentTimeMillis();
-            PlanificadorALNS alns = new PlanificadorALNS(pool, routes, flights, airports, (long) rep);
+            PlanificadorALNS alns = new PlanificadorALNS(pool, routes, flights, airports, semilla);
             ResultadoALNS resultado = alns.ejecutarALNS(criticos, TIEMPO_LIMITE_NORMAL_MS, MAX_ITER_NORMAL);
             long tiempoMs = System.currentTimeMillis() - t0;
 
@@ -647,7 +651,8 @@ public class MainALNS {
 
             // 15 réplicas para este nivel
             for (int rep = 1; rep <= NUM_REPLICAS; rep++) {
-                System.out.printf("  Réplica %d/%d (semilla=%d)...%n", rep, NUM_REPLICAS, rep);
+                long semilla = SEMILLAS[rep - 1];
+                System.out.printf("  Réplica %d/%d (semilla=%d)...%n", rep, NUM_REPLICAS, semilla);
 
                 ActiveShipmentPool pool = new ActiveShipmentPool(envios.size() + 1000);
                 RouteStore routes = new RouteStore(envios.size() + 1000);
@@ -661,7 +666,7 @@ public class MainALNS {
                 for (int i = 0; i < pool.getSize(); i++) criticos.add(i);
 
                 long t0 = System.currentTimeMillis();
-                PlanificadorALNS alns = new PlanificadorALNS(pool, routes, flights, airports, (long) rep);
+                PlanificadorALNS alns = new PlanificadorALNS(pool, routes, flights, airports, semilla);
                 ResultadoALNS resultado = alns.ejecutarALNS(criticos, TIEMPO_LIMITE_COLAPSO_MS);
                 long tiempoMs = System.currentTimeMillis() - t0;
 
