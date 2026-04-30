@@ -9,7 +9,7 @@ public class PlanificadorALNS {
     private RouteStore routes;
     private FlightCapacityStore flights;
     private AirportCapacityTimeline airports;
-    private Random rand = new Random();
+    private final Random rand;
 
     // Pesos para operadores
     private double[] destroyWeights = {1,1,1,1,1};
@@ -19,11 +19,16 @@ public class PlanificadorALNS {
     private double[] destroyScores = {0,0,0,0,0};
     private double[] repairScores = {0,0,0,0};
 
+    /** Constructor reproducible: pasa una semilla fija para experimentos. */
+    public PlanificadorALNS(ActiveShipmentPool p, RouteStore r, FlightCapacityStore f,
+                             AirportCapacityTimeline a, long seed) {
+        pool = p; routes = r; flights = f; airports = a;
+        rand = new Random(seed);
+    }
+
+    /** Constructor sin semilla (modo normal del compañero — no determinista). */
     public PlanificadorALNS(ActiveShipmentPool p, RouteStore r, FlightCapacityStore f, AirportCapacityTimeline a) {
-        pool = p;
-        routes = r;
-        flights = f;
-        airports = a;
+        this(p, r, f, a, System.currentTimeMillis());
     }
 
     public ResultadoALNS ejecutarALNS(List<Integer> criticos, long timeLimitMs) {

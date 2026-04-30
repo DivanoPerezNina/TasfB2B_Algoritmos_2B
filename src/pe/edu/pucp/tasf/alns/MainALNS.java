@@ -27,6 +27,9 @@ public class MainALNS {
     /** Tiempo límite del ALNS en el modo colapso (ms). */
     private static final long TIEMPO_LIMITE_COLAPSO_MS = 30_000L;
 
+    /** Número de réplicas independientes por escenario. */
+    private static final int NUM_REPLICAS = 15;
+
     public static void main(String[] args) throws IOException {
         if (MODO_EXPNUM_ALNS) {
             try {
@@ -121,7 +124,7 @@ public class MainALNS {
 
             try (ShipmentStreamManager manager = new ShipmentStreamManager()) {
                 System.out.println("Streams abiertos=" + manager.getStreamsAbiertos());
-                
+
                 long minReleaseInManager = manager.peekNextReleaseUTC();
                 System.out.println("Min release encontrado en streams=" + minReleaseInManager);
 
@@ -152,21 +155,21 @@ public class MainALNS {
                     while (manager.hasNextBefore(blockEnd)) {
                         ShipmentRecord rec = manager.pollNext();
                         if (rec == null) break;
-                        
+
                         if (rec.releaseUTC < blockStart) {
                             continue;
                         }
                         readsThisBlock++;
                         totalEnviosLeidosBloques++;
                         met.enviosLeidos++;
-                        
+
                         if (rec.releaseUTC < primerReleaseUTC) {
                             primerReleaseUTC = rec.releaseUTC;
                         }
                         if (rec.releaseUTC > ultimoReleaseUTC) {
                             ultimoReleaseUTC = rec.releaseUTC;
                         }
-                        
+
                         if (firstRelease < 0) firstRelease = rec.releaseUTC;
                         lastRelease = rec.releaseUTC;
 
@@ -180,7 +183,7 @@ public class MainALNS {
                         } else {
                             pool.setStatus(activeIdx, ActiveShipmentPool.PENDIENTE);
                         }
-                        
+
                         if (ConfigExperimentacion.MAX_ENVIOS_DEBUG > 0 && met.enviosLeidos >= ConfigExperimentacion.MAX_ENVIOS_DEBUG) {
                             System.out.println("Límite de debug alcanzado: " + ConfigExperimentacion.MAX_ENVIOS_DEBUG);
                             break;
@@ -384,7 +387,7 @@ public class MainALNS {
             Runtime rt = Runtime.getRuntime();
             met.memoriaUsadaMB = (rt.totalMemory() - rt.freeMemory()) / (1024.0 * 1024.0);
             resumen.add(met);
-            
+
             System.out.println("\nEscenario " + met.escenario + " completado:");
             System.out.println("  Total leidos=" + met.enviosLeidos + " (acum=" + totalEnviosLeidosBloques + ")");
             System.out.println("  Entregados=" + met.enviosEntregados + " pendientes=" + met.enviosPendientes +
@@ -454,38 +457,37 @@ public class MainALNS {
     }
 
     // =========================================================================
-    // MODO EXPNUM ALNS — Experimento Numérico Base (3 días, capacidades reales)
+    // MODO EXPNUM ALNS — Experimento Numérico Base (3 días, 15 réplicas)
     // =========================================================================
 
     /**
-     * Ejecuta el experimento numérico base del ALNS equivalente al GVNS de 3 días:
-     * capacidades reales, ventana de 3 días desde {@code FECHA_INICIO_AAAAMMDD},
-     * y 120 s de optimización (mismo límite que el GVNS Fase 3).
+     * Ejecuta el experimento numérico base del ALNS: 15 réplicas con semillas
+     * 1-15, capacidades reales, ventana de 3 días desde
+     * {@code FECHA_INICIO_AAAAMMDD}, 120 s por réplica (mismo límite GVNS Fase 3).
      *
-     * <p>Produce dos archivos en {@code resultados_3D/}:
+     * <p>Exporta a {@code resultados_3D/}:
      * <ul>
-     *   <li>{@code resultados_3dias_ALNS.csv} — métricas finales.</li>
-     *   <li>{@code convergencia_3dias_ALNS.csv} — curva de mejora iteración a iteración.</li>
+     *   <li>{@code resultados_3dias_ALNS.csv} — una fila por réplica (columnar).</li>
+     *   <li>{@code convergencia_3dias_ALNS.csv} — curva de mejora de las 15 réplicas.</li>
      * </ul>
      *
-     * <p>Para activar: cambiar {@code MODO_EXPNUM_ALNS = true} y compilar.
+     * <p>Para activar: {@code MODO_EXPNUM_ALNS = true}.
      */
     public static void ejecutarModoNormalALNS() throws Exception {
-        // Mismo tiempo de optimización que el GVNS Fase 3
         final long TIEMPO_LIMITE_NORMAL_MS = 120_000L;
-        // Sin tope de iteraciones: solo el tiempo límite gobierna
-        final int  MAX_ITER_NORMAL        = Integer.MAX_VALUE;
+        final int  MAX_ITER_NORMAL         = Integer.MAX_VALUE;
 
         System.out.println("======================================================");
-        System.out.println(" EXPNUM ALNS — Experimento Numérico Base (3 días)");
+        System.out.println(" EXPNUM ALNS — Experimento Numérico Base (3 días, 15 réplicas)");
         System.out.printf ("   Fecha inicio : %d%n", ConfigExperimentacion.FECHA_INICIO_AAAAMMDD);
-        System.out.printf ("   Tiempo ALNS  : %.0f s%n", TIEMPO_LIMITE_NORMAL_MS / 1000.0);
+        System.out.printf ("   Tiempo ALNS  : %.0f s | Réplicas: %d%n",
+                TIEMPO_LIMITE_NORMAL_MS / 1000.0, NUM_REPLICAS);
         System.out.println("======================================================");
 
-        // 1. Cargar red con capacidades reales (sin estrangulamiento)
+        // 1. Cargar red con capacidades reales
         DatosEstaticos.cargarDatos();
 
-        // 2. Ventana de 3 días desde la fecha configurada
+        // 2. Ventana de 3 días
         int fecha   = ConfigExperimentacion.FECHA_INICIO_AAAAMMDD;
         int anio    = fecha / 10000;
         int mes     = (fecha / 100) % 100;
@@ -493,234 +495,275 @@ public class MainALNS {
         long inicioUTC = DatosEstaticos.calcularEpochMinutos(anio, mes, dia, 0, 0, 0);
         long finUTC    = inicioUTC + 3L * 1440L;
 
-        System.out.printf("%nVentana UTC [%d → %d] (3 días)...%n", inicioUTC, finUTC);
+        System.out.printf("%nCargando envíos [UTC %d → %d]...%n", inicioUTC, finUTC);
 
-        // 3. Cargar TODOS los envíos de la ventana vía streaming (sin cap de volumen)
-        ActiveShipmentPool pool    = new ActiveShipmentPool(50_000);
-        RouteStore         routes  = new RouteStore(50_000);
-        FlightCapacityStore flights = new FlightCapacityStore();
-        AirportCapacityTimeline airports =
-                new AirportCapacityTimeline(DatosEstaticos.airportCode.length);
+        // 3. Materializar envíos una sola vez (streaming → lista)
+        List<ShipmentRecord> envios = cargarEnviosEnLista(inicioUTC, finUTC, 0);
+        System.out.printf("Envíos cargados: %,d%n", envios.size());
 
-        int cargados = 0;
-        try (ShipmentStreamManager manager = new ShipmentStreamManager()) {
-            System.out.println("Streams abiertos: " + manager.getStreamsAbiertos());
-            while (manager.hasNextBefore(finUTC)) {
-                ShipmentRecord rec = manager.pollNext();
-                if (rec == null) break;
-                if (rec.releaseUTC < inicioUTC) continue;
-                int idx = pool.addShipment(rec);
-                routes.ensureCapacity(pool.getCapacity());
-                pool.setStatus(idx, ActiveShipmentPool.PENDIENTE);
-                cargados++;
-            }
-        }
-        System.out.printf("Envíos cargados: %,d%n", cargados);
-
-        if (cargados == 0) {
+        if (envios.isEmpty()) {
             System.err.println("No se encontraron envíos en la ventana configurada.");
             return;
         }
 
-        // 4. Todos son críticos (sin ruta aún)
-        List<Integer> criticos = new ArrayList<>();
-        for (int i = 0; i < pool.getSize(); i++) criticos.add(i);
+        // 4. Preparar archivos de salida
+        new File("resultados_3D").mkdirs();
+        String archivoDatos = "resultados_3D/resultados_3dias_ALNS.csv";
+        String archivoConv  = "resultados_3D/convergencia_3dias_ALNS.csv";
 
-        // 5. Ejecutar ALNS durante exactamente 120 s (sin tope de iteraciones)
-        System.out.printf("%nIniciando ALNS (%,d críticos | %.0f s límite)...%n",
-                criticos.size(), TIEMPO_LIMITE_NORMAL_MS / 1000.0);
-        long t0 = System.currentTimeMillis();
-        PlanificadorALNS alns = new PlanificadorALNS(pool, routes, flights, airports);
-        ResultadoALNS resultado = alns.ejecutarALNS(criticos, TIEMPO_LIMITE_NORMAL_MS, MAX_ITER_NORMAL);
-        long tiempoMs = System.currentTimeMillis() - t0;
+        try (PrintWriter pw = new PrintWriter(new FileWriter(archivoDatos))) {
+            pw.println("Replica,Total Envios,Exitosos Total,Salvados ALNS,Rechazados Finales,"
+                     + "Transito Final (min),Tiempo ALNS (s),Iteraciones ALNS,Mejor FO,Tasa Exito Final (%)");
+        }
+        try (PrintWriter pw = new PrintWriter(new FileWriter(archivoConv))) {
+            pw.println("Replica,iteracion,ms_transcurridos,mejor_fitness");
+        }
 
-        // 6. Métricas finales
-        int exitosos = 0, rechazadosFinales = 0;
-        long transitoMin = 0;
-        for (int i = 0; i < pool.getSize(); i++) {
-            byte s = pool.getStatus(i);
-            if (s == ActiveShipmentPool.ENTREGADO) {
-                exitosos++;
-                int rLen = routes.getRouteLength(i);
-                if (rLen > 0) {
-                    int fl   = routes.getFlightId(i, rLen - 1);
-                    long dep = routes.getDepartureUTC(i, rLen - 1);
-                    int durMin = DatosEstaticos.flightArrivalUTCMinuteOfDay[fl]
-                               - DatosEstaticos.flightDepartureUTCMinuteOfDay[fl];
-                    if (durMin <= 0) durMin += 1440;
-                    transitoMin += (dep + durMin) - pool.getReleaseUTC(i);
+        // 5. Bucle de réplicas con semillas 1-15
+        for (int rep = 1; rep <= NUM_REPLICAS; rep++) {
+            System.out.printf("%n--- Réplica %d/%d (semilla=%d) ---%n", rep, NUM_REPLICAS, rep);
+
+            ActiveShipmentPool pool = new ActiveShipmentPool(envios.size() + 1000);
+            RouteStore routes = new RouteStore(envios.size() + 1000);
+            FlightCapacityStore flights = new FlightCapacityStore();
+            AirportCapacityTimeline airports =
+                    new AirportCapacityTimeline(DatosEstaticos.airportCode.length);
+
+            poblarPool(envios, pool, routes);
+
+            List<Integer> criticos = new ArrayList<>();
+            for (int i = 0; i < pool.getSize(); i++) criticos.add(i);
+
+            long t0 = System.currentTimeMillis();
+            PlanificadorALNS alns = new PlanificadorALNS(pool, routes, flights, airports, (long) rep);
+            ResultadoALNS resultado = alns.ejecutarALNS(criticos, TIEMPO_LIMITE_NORMAL_MS, MAX_ITER_NORMAL);
+            long tiempoMs = System.currentTimeMillis() - t0;
+
+            long[] metricas = calcularMetricasPool(pool, routes);
+            long exitosos    = metricas[0];
+            long rechazados  = metricas[1];
+            long transitoMin = metricas[2];
+            double tasa = envios.size() > 0 ? exitosos * 100.0 / envios.size() : 0;
+
+            System.out.printf("  Exitosos: %,d | Rechazados: %,d | Iter: %d | %.1f s%n",
+                    exitosos, rechazados, resultado.iteraciones, tiempoMs / 1000.0);
+
+            // Fila de datos (append)
+            try (PrintWriter pw = new PrintWriter(new FileWriter(archivoDatos, true))) {
+                pw.printf("%d,%d,%d,%d,%d,%d,%.3f,%d,%d,%.4f%n",
+                        rep, envios.size(), exitosos, resultado.reparados, rechazados,
+                        transitoMin, tiempoMs / 1000.0, resultado.iteraciones,
+                        (long) resultado.fitnessDespuesALNS, tasa);
+            }
+            // Filas de convergencia (append)
+            try (PrintWriter pw = new PrintWriter(new FileWriter(archivoConv, true))) {
+                if (resultado.convergencia != null) {
+                    for (long[] row : resultado.convergencia) {
+                        pw.printf("%d,%d,%d,%d%n", rep, row[0], row[1], row[2]);
+                    }
                 }
-            } else {
-                rechazadosFinales++;
             }
         }
 
-        System.out.printf("Exitosos: %,d | Rechazados: %,d | Iteraciones: %d | Tiempo: %.1f s%n",
-                exitosos, rechazadosFinales, resultado.iteraciones, tiempoMs / 1000.0);
-
-        // 7. Exportar
-        new File("resultados_3D").mkdirs();
-        exportarResultadosNormalALNS(
-                "resultados_3D/resultados_3dias_ALNS.csv",
-                cargados, exitosos, rechazadosFinales, transitoMin,
-                tiempoMs / 1000.0, resultado);
-        exportarConvergenciaColapsoALNS(
-                "resultados_3D/convergencia_3dias_ALNS.csv",
-                resultado);
-
         System.out.println("\n====== EXPNUM ALNS COMPLETADO ======");
-        System.out.println("  resultados_3D/resultados_3dias_ALNS.csv");
-        System.out.println("  resultados_3D/convergencia_3dias_ALNS.csv");
-    }
-
-    /** Exporta las métricas del experimento normal (mismo esquema que el GVNS). */
-    private static void exportarResultadosNormalALNS(String archivo, int totalEnvios,
-            int exitosos, int rechazados, long transitoMin,
-            double tiempoS, ResultadoALNS resultado) {
-        try (PrintWriter pw = new PrintWriter(new FileWriter(archivo))) {
-            double tasa = totalEnvios > 0 ? exitosos * 100.0 / totalEnvios : 0;
-            pw.println("Metrica,Valor");
-            pw.println("Total Envios,"         + totalEnvios);
-            pw.println("Exitosos Total,"        + exitosos);
-            pw.println("Salvados ALNS,"         + resultado.reparados);
-            pw.println("Rechazados Finales,"    + rechazados);
-            pw.println("Transito Final (min),"  + transitoMin);
-            pw.println("Tiempo ALNS (s),"       + String.format("%.3f", tiempoS));
-            pw.println("Iteraciones ALNS,"      + resultado.iteraciones);
-            pw.println("Mejor FO,"              + (long) resultado.fitnessDespuesALNS);
-            pw.println("Tasa Exito Final (%),"  + String.format("%.4f", tasa));
-            System.out.println("Resultados exportados: " + archivo);
-        } catch (Exception ex) {
-            System.err.println("Error exportando resultados normales: " + ex.getMessage());
-        }
+        System.out.println("  " + archivoDatos);
+        System.out.println("  " + archivoConv);
     }
 
     // =========================================================================
-    // MODO COLAPSO ALNS — Prueba de Estrés
+    // MODO COLAPSO ALNS — Prueba de Estrés (15 réplicas)
     // =========================================================================
 
     /**
      * Ejecuta la prueba de estrés del ALNS con los mismos 5 niveles de carga
-     * que el GVNS, exportando archivos compatibles con los scripts R.
+     * que el GVNS, 15 réplicas por nivel con semillas 1-15.
      *
-     * <p>Para activar: cambiar {@code MODO_COLAPSO_ALNS = true} y compilar.</p>
+     * <p>Para activar: {@code MODO_COLAPSO_ALNS = true}.</p>
      */
     public static void ejecutarModoColapsoALNS() throws Exception {
         System.out.println("======================================================");
-        System.out.println(" MODO COLAPSO ALNS — Prueba de Estrés de la Red");
+        System.out.println(" MODO COLAPSO ALNS — Prueba de Estrés (15 réplicas)");
+        System.out.printf ("   Cap. vuelo   : %d maletas | Tiempo: %.0f s | Réplicas: %d%n",
+                CAP_ESTRANGULAMIENTO, TIEMPO_LIMITE_COLAPSO_MS / 1000.0, NUM_REPLICAS);
         System.out.println("======================================================");
 
-        // 1. Cargar red (aeropuertos + vuelos)
+        // 1. Cargar red
         DatosEstaticos.cargarDatos();
 
-        // 2. Forzar capacidad = CAP_ESTRANGULAMIENTO en todos los vuelos
+        // 2. Estrangular capacidad de vuelos
         for (int f = 0; f < DatosEstaticos.numFlights; f++) {
             DatosEstaticos.flightCapacity[f] = CAP_ESTRANGULAMIENTO;
         }
         System.out.printf("Red estrangulada: %d vuelos × cap=%d%n",
                 DatosEstaticos.numFlights, CAP_ESTRANGULAMIENTO);
 
-        // 3. Encontrar día pico escaneando todos los streams
+        // 3. Día pico y ventana de 3 días
         long[] pico = encontrarDiaPicoALNS();
-        long inicioPico = pico[0];   // inicio del día pico en UTC minutos
-        long maletasPico = pico[1];  // maletas totales ese día
+        long inicioPico  = pico[0];
+        long maletasPico = pico[1];
         System.out.printf("Día pico: UTC %d | Maletas: %,d%n", inicioPico, maletasPico);
 
-        // 4. Contar envíos (registros) en ese día — es la referencia 100%
         long enviosPicoDia = contarEnviosPicoDia(inicioPico, inicioPico + 1440L);
         System.out.printf("Envíos (registros) en día pico: %,d%n", enviosPicoDia);
 
         long fin3Dias = inicioPico + 3L * 1440L;
 
-        // 5. Niveles de carga
+        // 4. Niveles de carga
         double[] factores  = {1.00, 1.15, 1.30, 1.50, 2.00};
         String[] etiquetas = {"100", "115", "130", "150", "200"};
 
-        // 6. Carpeta de salida y CSV resumen (append sobre el existente del GVNS)
+        // 5. Archivos de salida
         new File("resultados_colapso").mkdirs();
-        String archivoDatos = "resultados_colapso/datos_colapso_davila.csv";
+        String archivoDatosSummary = "resultados_colapso/datos_colapso_alns.csv";
 
-        // 7. Iterar sobre niveles
+        // Header del resumen global
+        try (PrintWriter pw = new PrintWriter(new FileWriter(archivoDatosSummary))) {
+            pw.println("Replica,Algoritmo,Volumen_Maletas,Porcentaje_Colapso");
+        }
+
+        // 6. Bucle por nivel de carga
         for (int lv = 0; lv < factores.length; lv++) {
             int targetEnvios = (int) Math.round(enviosPicoDia * factores[lv]);
             String et = etiquetas[lv];
 
-            System.out.printf("%n--- Nivel %s (+%.0f%%) | target: %,d envíos ---%n",
+            System.out.printf("%n=== Nivel %s (+%.0f%%) | target: %,d envíos ===%n",
                     et, (factores[lv] - 1.0) * 100, targetEnvios);
 
-            // Estructuras frescas por nivel
-            int poolSize = Math.max(targetEnvios + 5000, 10000);
-            ActiveShipmentPool pool = new ActiveShipmentPool(poolSize);
-            RouteStore routes = new RouteStore(poolSize);
-            FlightCapacityStore flights = new FlightCapacityStore();
-            AirportCapacityTimeline airports =
-                    new AirportCapacityTimeline(DatosEstaticos.airportCode.length);
+            // Materializar envíos del nivel una sola vez
+            List<ShipmentRecord> envios = cargarEnviosEnLista(inicioPico, fin3Dias, targetEnvios);
+            System.out.printf("  Cargados: %,d envíos%n", envios.size());
 
-            // Cargar envíos vía streaming (3-day window, cap en targetEnvios)
-            int cargados = 0;
-            try (ShipmentStreamManager manager = new ShipmentStreamManager()) {
-                while (manager.hasNextBefore(fin3Dias) && cargados < targetEnvios) {
-                    ShipmentRecord rec = manager.pollNext();
-                    if (rec == null) break;
-                    if (rec.releaseUTC < inicioPico) continue;
-                    int idx = pool.addShipment(rec);
-                    routes.ensureCapacity(pool.getCapacity());
-                    pool.setStatus(idx, ActiveShipmentPool.PENDIENTE);
-                    cargados++;
-                }
+            String archivoNivel = "resultados_colapso/resultados_colapso_ALNS_" + et + ".csv";
+            String archivoConv  = "resultados_colapso/convergencia_colapso_ALNS_" + et + ".csv";
+
+            // Headers por nivel
+            try (PrintWriter pw = new PrintWriter(new FileWriter(archivoNivel))) {
+                pw.println("Replica,Total Envios,Exitosos Total,Salvados ALNS,Rechazados Finales,"
+                         + "Transito Final (min),Tiempo ALNS (s),Iteraciones ALNS,Mejor FO,Tasa Exito Final (%)");
             }
-            System.out.printf("  Cargados: %,d envíos%n", cargados);
+            try (PrintWriter pw = new PrintWriter(new FileWriter(archivoConv))) {
+                pw.println("Replica,iteracion,ms_transcurridos,mejor_fitness");
+            }
 
-            // Todos los envíos son críticos (aún sin ruta)
-            List<Integer> criticos = new ArrayList<>();
-            for (int i = 0; i < pool.getSize(); i++) criticos.add(i);
+            // 15 réplicas para este nivel
+            for (int rep = 1; rep <= NUM_REPLICAS; rep++) {
+                System.out.printf("  Réplica %d/%d (semilla=%d)...%n", rep, NUM_REPLICAS, rep);
 
-            // Ejecutar ALNS con límite de 30 s
-            long t0 = System.currentTimeMillis();
-            PlanificadorALNS alns = new PlanificadorALNS(pool, routes, flights, airports);
-            ResultadoALNS resultado = alns.ejecutarALNS(criticos, TIEMPO_LIMITE_COLAPSO_MS);
-            long tiempoMs = System.currentTimeMillis() - t0;
+                ActiveShipmentPool pool = new ActiveShipmentPool(envios.size() + 1000);
+                RouteStore routes = new RouteStore(envios.size() + 1000);
+                FlightCapacityStore flights = new FlightCapacityStore();
+                AirportCapacityTimeline airports =
+                        new AirportCapacityTimeline(DatosEstaticos.airportCode.length);
 
-            // Métricas finales
-            int exitosos = 0, rechazadosFinales = 0;
-            long transitoMin = 0;
-            for (int i = 0; i < pool.getSize(); i++) {
-                byte s = pool.getStatus(i);
-                if (s == ActiveShipmentPool.ENTREGADO) {
-                    exitosos++;
-                    int rLen = routes.getRouteLength(i);
-                    if (rLen > 0) {
-                        int fl  = routes.getFlightId(i, rLen - 1);
-                        long dep = routes.getDepartureUTC(i, rLen - 1);
-                        int durMin = DatosEstaticos.flightArrivalUTCMinuteOfDay[fl]
-                                   - DatosEstaticos.flightDepartureUTCMinuteOfDay[fl];
-                        if (durMin <= 0) durMin += 1440;
-                        transitoMin += (dep + durMin) - pool.getReleaseUTC(i);
+                poblarPool(envios, pool, routes);
+
+                List<Integer> criticos = new ArrayList<>();
+                for (int i = 0; i < pool.getSize(); i++) criticos.add(i);
+
+                long t0 = System.currentTimeMillis();
+                PlanificadorALNS alns = new PlanificadorALNS(pool, routes, flights, airports, (long) rep);
+                ResultadoALNS resultado = alns.ejecutarALNS(criticos, TIEMPO_LIMITE_COLAPSO_MS);
+                long tiempoMs = System.currentTimeMillis() - t0;
+
+                long[] metricas = calcularMetricasPool(pool, routes);
+                long exitosos    = metricas[0];
+                long rechazados  = metricas[1];
+                long transitoMin = metricas[2];
+                double pctColapso = envios.size() > 0 ? rechazados * 100.0 / envios.size() : 0;
+                double tasa       = envios.size() > 0 ? exitosos   * 100.0 / envios.size() : 0;
+
+                System.out.printf("    Exitosos: %,d | Rechazados: %,d | Colapso: %.2f%%%n",
+                        exitosos, rechazados, pctColapso);
+
+                // Resumen global (append)
+                try (PrintWriter pw = new PrintWriter(new FileWriter(archivoDatosSummary, true))) {
+                    pw.printf("%d,ALNS,%d,%.2f%n", rep, envios.size(), pctColapso);
+                }
+                // Detalle por nivel (append)
+                try (PrintWriter pw = new PrintWriter(new FileWriter(archivoNivel, true))) {
+                    pw.printf("%d,%d,%d,%d,%d,%d,%.3f,%d,%d,%.4f%n",
+                            rep, envios.size(), exitosos, resultado.reparados, rechazados,
+                            transitoMin, tiempoMs / 1000.0, resultado.iteraciones,
+                            (long) resultado.fitnessDespuesALNS, tasa);
+                }
+                // Convergencia por nivel (append)
+                try (PrintWriter pw = new PrintWriter(new FileWriter(archivoConv, true))) {
+                    if (resultado.convergencia != null) {
+                        for (long[] row : resultado.convergencia) {
+                            pw.printf("%d,%d,%d,%d%n", rep, row[0], row[1], row[2]);
+                        }
                     }
-                } else {
-                    rechazadosFinales++;
                 }
             }
-            double pctColapso = cargados > 0 ? rechazadosFinales * 100.0 / cargados : 0;
 
-            System.out.printf("  Exitosos: %,d | Rechazados: %,d | Colapso: %.2f%%%n",
-                    exitosos, rechazadosFinales, pctColapso);
-            System.out.printf("  Iteraciones ALNS: %d | Tiempo: %.1f s%n",
-                    resultado.iteraciones, tiempoMs / 1000.0);
-
-            // Exportar archivos
-            exportarResultadosColapsoALNS(
-                    "resultados_colapso/resultados_colapso_ALNS_" + et + ".csv",
-                    cargados, exitosos, rechazadosFinales, transitoMin,
-                    tiempoMs / 1000.0, resultado);
-            exportarConvergenciaColapsoALNS(
-                    "resultados_colapso/convergencia_colapso_ALNS_" + et + ".csv",
-                    resultado);
-            appendResumenColapso(archivoDatos, "ALNS", cargados, pctColapso);
+            System.out.printf("  Nivel %s completado (%d réplicas).%n", et, NUM_REPLICAS);
         }
 
         System.out.println("\n====== MODO COLAPSO ALNS COMPLETADO ======");
         System.out.println("Archivos en: resultados_colapso/");
+        System.out.println("  datos_colapso_alns.csv  (resumen " + NUM_REPLICAS + " réplicas × 5 niveles)");
+        System.out.println("  resultados_colapso_ALNS_{nivel}.csv  (detalle por nivel)");
+        System.out.println("  convergencia_colapso_ALNS_{nivel}.csv  (convergencia por nivel)");
+    }
+
+    // =========================================================================
+    // Helpers compartidos
+    // =========================================================================
+
+    /**
+     * Materializa los envíos del rango UTC dado desde los streams en una lista.
+     * {@code maxEnvios} ≤ 0 significa sin límite de volumen.
+     */
+    private static List<ShipmentRecord> cargarEnviosEnLista(
+            long inicioUTC, long finUTC, int maxEnvios) throws IOException {
+        List<ShipmentRecord> lista = new ArrayList<>();
+        try (ShipmentStreamManager manager = new ShipmentStreamManager()) {
+            while (manager.hasNextBefore(finUTC)) {
+                ShipmentRecord rec = manager.pollNext();
+                if (rec == null) break;
+                if (rec.releaseUTC < inicioUTC) continue;
+                lista.add(rec);
+                if (maxEnvios > 0 && lista.size() >= maxEnvios) break;
+            }
+        }
+        return lista;
+    }
+
+    /** Puebla un pool vacío a partir de una lista pre-cargada. */
+    private static void poblarPool(List<ShipmentRecord> envios,
+            ActiveShipmentPool pool, RouteStore routes) {
+        for (ShipmentRecord rec : envios) {
+            int idx = pool.addShipment(rec);
+            routes.ensureCapacity(pool.getCapacity());
+            pool.setStatus(idx, ActiveShipmentPool.PENDIENTE);
+        }
+    }
+
+    /**
+     * Calcula métricas del pool tras ejecutar el ALNS.
+     *
+     * @return {@code long[]{exitosos, rechazados, transitoMin}}
+     */
+    private static long[] calcularMetricasPool(ActiveShipmentPool pool, RouteStore routes) {
+        long exitosos = 0, rechazados = 0, transitoMin = 0;
+        for (int i = 0; i < pool.getSize(); i++) {
+            byte s = pool.getStatus(i);
+            if (s == ActiveShipmentPool.ENTREGADO) {
+                exitosos++;
+                int rLen = routes.getRouteLength(i);
+                if (rLen > 0) {
+                    int  fl    = routes.getFlightId(i, rLen - 1);
+                    long dep   = routes.getDepartureUTC(i, rLen - 1);
+                    int durMin = DatosEstaticos.flightArrivalUTCMinuteOfDay[fl]
+                               - DatosEstaticos.flightDepartureUTCMinuteOfDay[fl];
+                    if (durMin <= 0) durMin += 1440;
+                    transitoMin += (dep + durMin) - pool.getReleaseUTC(i);
+                }
+            } else {
+                rechazados++;
+            }
+        }
+        return new long[]{exitosos, rechazados, transitoMin};
     }
 
     /**
@@ -743,7 +786,7 @@ public class MainALNS {
         if (maletasPorDia.isEmpty()) {
             throw new RuntimeException("No se encontraron envíos en los archivos de streaming.");
         }
-        long peakDay = maletasPorDia.entrySet().stream()
+        long peakDay   = maletasPorDia.entrySet().stream()
                 .max(Map.Entry.comparingByValue())
                 .orElseThrow().getKey();
         long maletasPico = maletasPorDia.get(peakDay);
@@ -765,61 +808,5 @@ public class MainALNS {
             }
         }
         return count;
-    }
-
-    /** Exporta el archivo de detalles por nivel (formato idéntico al GVNS). */
-    private static void exportarResultadosColapsoALNS(String archivo, int totalEnvios,
-            int exitosos, int rechazados, long transitoMin,
-            double tiempoS, ResultadoALNS resultado) {
-        try (PrintWriter pw = new PrintWriter(new FileWriter(archivo))) {
-            pw.println("Metrica,Valor");
-            pw.println("Total Envios,"             + totalEnvios);
-            pw.println("Exitosos Total,"            + exitosos);
-            pw.println("Rechazados Finales,"        + rechazados);
-            pw.println("Transito Final (min),"      + transitoMin);
-            pw.println("Tiempo ALNS (s),"           + String.format("%.3f", tiempoS));
-            pw.println("Iteraciones ALNS,"          + resultado.iteraciones);
-            pw.println("Criticos Antes ALNS,"       + resultado.criticosAntes);
-            pw.println("Criticos Despues ALNS,"     + resultado.criticosDespues);
-            pw.println("Reparados ALNS,"            + resultado.reparados);
-            double tasa = totalEnvios > 0 ? exitosos * 100.0 / totalEnvios : 0;
-            pw.println("Tasa Exito Final (%),"      + String.format("%.4f", tasa));
-            System.out.println("Resultados exportados: " + archivo);
-        } catch (Exception ex) {
-            System.err.println("Error exportando resultados: " + ex.getMessage());
-        }
-    }
-
-    /** Exporta la curva de convergencia del ALNS (formato idéntico al GVNS). */
-    private static void exportarConvergenciaColapsoALNS(String archivo, ResultadoALNS resultado) {
-        try (PrintWriter pw = new PrintWriter(new FileWriter(archivo))) {
-            pw.println("iteracion,ms_transcurridos,mejor_fitness");
-            if (resultado.convergencia != null) {
-                for (long[] row : resultado.convergencia) {
-                    pw.printf("%d,%d,%d%n", row[0], row[1], row[2]);
-                }
-            }
-            System.out.println("Convergencia exportada: " + archivo);
-        } catch (Exception ex) {
-            System.err.println("Error exportando convergencia: " + ex.getMessage());
-        }
-    }
-
-    /**
-     * Agrega una fila al CSV resumen compartido con el GVNS.
-     * Si el archivo no existe o está vacío, escribe el encabezado.
-     */
-    private static void appendResumenColapso(String archivo, String algoritmo,
-            int volumen, double pctColapso) {
-        try {
-            File f = new File(archivo);
-            boolean escribirHeader = !f.exists() || f.length() == 0;
-            try (PrintWriter pw = new PrintWriter(new FileWriter(archivo, true))) {
-                if (escribirHeader) pw.println("Algoritmo,Volumen_Maletas,Porcentaje_Colapso");
-                pw.printf("%s,%d,%.2f%n", algoritmo, volumen, pctColapso);
-            }
-        } catch (Exception ex) {
-            System.err.println("Error escribiendo resumen: " + ex.getMessage());
-        }
     }
 }
