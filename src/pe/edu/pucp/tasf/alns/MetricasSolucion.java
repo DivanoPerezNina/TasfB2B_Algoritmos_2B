@@ -11,6 +11,15 @@ public class MetricasSolucion {
     public int enviosPendientes;
     public int enviosSinRuta;
     public int enviosRetrasados;
+    public String escenariosActivos;
+    public int maxIteracionesALNS;
+    public boolean modoStressColapso;
+    public double factorCapacidadAeropuerto;
+    public double factorCapacidadVuelo;
+    public double tasaCriticaFinal;
+    public double tasaColapsoSLAFinal;
+    public double umbralColapsoSLA;
+    public boolean detenerPorColapsoSLA;
     public int noFactiblesEstructurales;
     public int replanificaciones;
     public String validacionBalance;

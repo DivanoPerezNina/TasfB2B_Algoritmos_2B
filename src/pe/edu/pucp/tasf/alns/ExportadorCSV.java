@@ -8,8 +8,9 @@ import java.util.Locale;
 
 public class ExportadorCSV {
     public static void exportarResumen(String archivo, List<MetricasSolucion> metricas) throws IOException {
+        if (metricas == null || metricas.isEmpty()) return;
         try (PrintWriter pw = new PrintWriter(new FileWriter(archivo))) {
-            pw.println("escenario,tamanoBloqueDias,inicioSimulacionUTCMin,finSimulacionUTCMin,diasSimulados,enviosLeidosTotal,enviosEntregadosTotal,enviosPendientesFinal,enviosSinRutaTotal,enviosRetrasadosTotal,enviosNoFactiblesTotal,ejecucionesALNSTotal,fitnessFinal,tiempoEjecucionMs,memoriaUsadaMB,bloquesProcesados,validacionBalance,razonParada");
+            pw.println("escenario,tamanoBloqueDias,inicioSimulacionUTCMin,finSimulacionUTCMin,diasSimulados,enviosLeidosTotal,enviosEntregadosTotal,enviosPendientesFinal,enviosSinRutaTotal,enviosRetrasadosTotal,enviosNoFactiblesTotal,ejecucionesALNSTotal,fitnessFinal,tiempoEjecucionMs,memoriaUsadaMB,bloquesProcesados,validacionBalance,escenariosActivos,maxIteracionesALNS,modoStressColapso,factorCapacidadAeropuerto,factorCapacidadVuelo,tasaCriticaFinal,tasaColapsoSLAFinal,umbralColapsoSLA,detenerPorColapsoSLA,razonParada");
 
             for (MetricasSolucion m : metricas) {
                 String fitness = String.format(Locale.US, "%.2f", m.fitnessFinal);
@@ -33,6 +34,15 @@ public class ExportadorCSV {
                     memoria + "," +
                     m.bloquesProcesados + "," +
                     m.validacionBalance + "," +
+                    m.escenariosActivos + "," +
+                    m.maxIteracionesALNS + "," +
+                    m.modoStressColapso + "," +
+                    m.factorCapacidadAeropuerto + "," +
+                    m.factorCapacidadVuelo + "," +
+                    m.tasaCriticaFinal + "," +
+                    m.tasaColapsoSLAFinal + "," +
+                    m.umbralColapsoSLA + "," +
+                    m.detenerPorColapsoSLA + "," +
                     m.razonParada
                 );
             }
@@ -45,7 +55,7 @@ public class ExportadorCSV {
 
     public static void exportarBloques(String archivo, List<MetricasBloque> metricas) throws IOException {
         try (PrintWriter pw = new PrintWriter(new FileWriter(archivo))) {
-            pw.println("escenario,tamanoBloqueDias,numeroBloque,inicioBloqueUTCMin,finBloqueUTCMin,primerEnvioBloqueUTCMin,ultimoEnvioBloqueUTCMin,enviosLeidosBloque,enviosEntregadosBloque,enviosPendientesAlCierre,enviosSinRutaBloque,enviosRetrasadosBloque,enviosNoFactiblesBloque,enviosCriticosAlCierre,ejecucionesALNSBloque,iteracionesALNSBloque,criticosAntesALNS,criticosDespuesALNS,pedidosReparadosALNS,sinRutaAntesALNS,sinRutaDespuesALNS,fitnessAntesALNS,fitnessDespuesALNS,mejoraOperativaALNS,tiempoBloqueMs,validacionBalance");
+            pw.println("escenario,tamanoBloqueDias,numeroBloque,inicioBloqueUTCMin,finBloqueUTCMin,primerEnvioBloqueUTCMin,ultimoEnvioBloqueUTCMin,enviosLeidosBloque,enviosEntregadosBloque,enviosPendientesAlCierre,enviosSinRutaBloque,enviosRetrasadosBloque,retrasadosAcumulados,tasaColapsoSLABloque,enviosNoFactiblesBloque,enviosCriticosAlCierre,ejecucionesALNSBloque,iteracionesALNSBloque,criticosAntesALNS,criticosDespuesALNS,pedidosReparadosALNS,sinRutaAntesALNS,sinRutaDespuesALNS,fitnessAntesALNS,fitnessDespuesALNS,mejoraOperativaALNS,tiempoBloqueMs,validacionBalance");
 
             for (MetricasBloque m : metricas) {
                 String fitnessAntesALNS = String.format(Locale.US, "%.2f", m.fitnessAntesALNS);
@@ -64,6 +74,8 @@ public class ExportadorCSV {
                     m.pendientesFinBloque + "," +
                     m.sinRutaBloque + "," +
                     m.retrasadosBloque + "," +
+                    m.retrasadosAcumulados + "," +
+                    m.tasaColapsoSLABloque + "," +
                     m.noFactiblesBloque + "," +
                     m.criticosFinBloque + "," +
                     m.llamadasALNS + "," +
@@ -90,8 +102,17 @@ public class ExportadorCSV {
     }
 
     private static void exportarBloquesPorEscenario(String escenario, String archivo, List<MetricasBloque> metricas) throws IOException {
+        List<MetricasBloque> encontrados = new java.util.ArrayList<>();
+        for (MetricasBloque m : metricas) {
+            if (escenario.equals(m.escenario)) {
+                encontrados.add(m);
+            }
+        }
+        if (encontrados.isEmpty()) {
+            return;
+        }
         try (PrintWriter pw = new PrintWriter(new FileWriter(archivo))) {
-            pw.println("escenario,tamanoBloqueDias,numeroBloque,inicioBloqueUTCMin,finBloqueUTCMin,primerEnvioBloqueUTCMin,ultimoEnvioBloqueUTCMin,enviosLeidosBloque,enviosEntregadosBloque,enviosPendientesAlCierre,enviosSinRutaBloque,enviosRetrasadosBloque,enviosNoFactiblesBloque,enviosCriticosAlCierre,ejecucionesALNSBloque,iteracionesALNSBloque,criticosAntesALNS,criticosDespuesALNS,pedidosReparadosALNS,sinRutaAntesALNS,sinRutaDespuesALNS,fitnessAntesALNS,fitnessDespuesALNS,mejoraOperativaALNS,tiempoBloqueMs,validacionBalance");
+            pw.println("escenario,tamanoBloqueDias,numeroBloque,inicioBloqueUTCMin,finBloqueUTCMin,primerEnvioBloqueUTCMin,ultimoEnvioBloqueUTCMin,enviosLeidosBloque,enviosEntregadosBloque,enviosPendientesAlCierre,enviosSinRutaBloque,enviosRetrasadosBloque,retrasadosAcumulados,tasaColapsoSLABloque,enviosNoFactiblesBloque,enviosCriticosAlCierre,ejecucionesALNSBloque,iteracionesALNSBloque,criticosAntesALNS,criticosDespuesALNS,pedidosReparadosALNS,sinRutaAntesALNS,sinRutaDespuesALNS,fitnessAntesALNS,fitnessDespuesALNS,mejoraOperativaALNS,tiempoBloqueMs,validacionBalance");
             for (MetricasBloque m : metricas) {
                 if (!escenario.equals(m.escenario)) continue;
                 String fitnessAntesALNS = String.format(Locale.US, "%.2f", m.fitnessAntesALNS);
@@ -110,6 +131,8 @@ public class ExportadorCSV {
                     m.pendientesFinBloque + "," +
                     m.sinRutaBloque + "," +
                     m.retrasadosBloque + "," +
+                    m.retrasadosAcumulados + "," +
+                    m.tasaColapsoSLABloque + "," +
                     m.noFactiblesBloque + "," +
                     m.criticosFinBloque + "," +
                     m.llamadasALNS + "," +

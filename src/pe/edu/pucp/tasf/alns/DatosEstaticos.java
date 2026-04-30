@@ -63,7 +63,10 @@ public class DatosEstaticos {
             airportCode[i] = code;
             airportGmt[i] = gmtList.get(i);
             airportContinent[i] = continentList.get(i);
-            airportCapacity[i] = capacityList.get(i);
+            int originalCapacity = capacityList.get(i);
+            airportCapacity[i] = ConfigExperimentacion.MODO_STRESS_COLAPSO
+                    ? Math.max(1, (int) Math.round(originalCapacity * ConfigExperimentacion.FACTOR_CAPACIDAD_AEROPUERTO))
+                    : originalCapacity;
             airportLat[i] = 0.0;
             airportLon[i] = 0.0;
             airportIdToCode[i] = code;
@@ -210,7 +213,9 @@ public class DatosEstaticos {
             flightDestination[i] = destId;
             flightDepartureUTCMinuteOfDay[i] = depMin;
             flightArrivalUTCMinuteOfDay[i] = arrMin;
-            flightCapacity[i] = cap;
+            flightCapacity[i] = ConfigExperimentacion.MODO_STRESS_COLAPSO
+                    ? Math.max(1, (int) Math.round(cap * ConfigExperimentacion.FACTOR_CAPACIDAD_VUELO))
+                    : cap;
             i++;
         }
         br.close();

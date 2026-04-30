@@ -15,6 +15,8 @@ public class MetricasBloque {
     public int pendientesFinBloque; // Pedidos que quedan pendientes al cierre del bloque.
     public int sinRutaBloque; // Pedidos del bloque que no pudieron asignarse a una ruta factible.
     public int retrasadosBloque;
+    public int retrasadosAcumulados;
+    public double tasaColapsoSLABloque;
     public int noFactiblesBloque;
     public int criticosFinBloque; // Pedidos críticos al cierre del bloque.
 
