@@ -1,6 +1,8 @@
 package pe.edu.pucp.tasf.gvns;
 
 import java.io.File;
+import java.io.FileWriter;
+import java.io.PrintWriter;
 
 /**
  * Main — Punto de entrada del motor de planificación logística Tasf.B2B.
@@ -27,6 +29,13 @@ public class Main {
     // =========================================================================
     // PARÁMETROS — Modificar aquí para cambiar el comportamiento
     // =========================================================================
+
+    /**
+     * {@code true} → ejecuta el modo colapso (prueba de estrés con
+     * estrangulamiento de red e inyección progresiva de carga).
+     * Tiene prioridad sobre {@link #MODO_EXPNUM}.
+     */
+    private static final boolean MODO_COLAPSO = false;
 
     /**
      * {@code true} → ejecuta el lote automatizado del experimento numérico
@@ -68,6 +77,10 @@ public class Main {
     // =========================================================================
 
     public static void main(String[] args) {
+        if (MODO_COLAPSO) {
+            ejecutarModoColapso();
+            return;
+        }
         if (MODO_EXPNUM) {
             ejecutarExperimento3Dias();
             return;
@@ -104,6 +117,160 @@ public class Main {
         } else {
             ejecutarEscenarioPeriodo(datos, inicioUTC, ESCENARIO);
         }
+    }
+
+    // =========================================================================
+    // MODO COLAPSO — PRUEBA DE ESTRÉS
+    // =========================================================================
+
+    /**
+     * Ejecuta la prueba de estrés de la red identificando el día pico,
+     * estrangulando la capacidad de vuelos a 50 maletas y ejecutando el
+     * algoritmo GVNS con carga progresiva (±30 % del volumen pico).
+     *
+     * <h3>Flujo completo</h3>
+     * <ol>
+     *   <li>Escanea los archivos de envíos para hallar el día con más demanda.</li>
+     *   <li>Carga los envíos del día pico y los 2 días siguientes.</li>
+     *   <li>Reduce la capacidad de todos los vuelos a 50 (cuello de botella).</li>
+     *   <li>Itera sobre 5 niveles de volumen: −30 %, −15 %, 0 %, +15 %, +30 %.</li>
+     *   <li>Para cada volumen ejecuta GVNS con criterios FIFO, EDF y ALEATORIO.</li>
+     *   <li>Escribe en {@code datos_colapso_davila.csv} (modo append).</li>
+     * </ol>
+     *
+     * <p><b>Nota sobre volúmenes mayores al pico real:</b> si el volumen objetivo
+     * supera los envíos disponibles en el dataset, se usa el total cargado y se
+     * registra una advertencia. Para superar el pico real se necesitaría datos
+     * sintéticos adicionales.
+     */
+    public static void ejecutarModoColapso() {
+        System.out.println("====================================================");
+        System.out.println(" MODO COLAPSO — Prueba de Estrés de la Red");
+        System.out.println("====================================================");
+
+        // ── 1. Cargar red ─────────────────────────────────────────────────────
+        GestorDatos datos = new GestorDatos();
+        datos.cargarAeropuertos(RUTA_AEROPUERTOS);
+        if (datos.numAeropuertos == 0) {
+            System.err.println("No se cargaron aeropuertos.");
+            return;
+        }
+        datos.cargarVuelos(RUTA_VUELOS);
+
+        // ── 2. Detectar día pico ──────────────────────────────────────────────
+        System.out.println("\n--- ANÁLISIS: DÍA PICO ---");
+        String[] pico = GestorDatos.encontrarDiaPico(RUTA_ENVIOS);
+        if (pico == null) {
+            System.err.println("No se pudo determinar el día pico.");
+            return;
+        }
+        String fechaPico   = pico[0];                      // "YYYYMMDD"
+        long   volumenPico = Long.parseLong(pico[1]);
+
+        System.out.printf("Día pico : %s/%s/%s%n",
+                fechaPico.substring(6), fechaPico.substring(4, 6), fechaPico.substring(0, 4));
+        System.out.printf("Volumen  : %,d envíos%n", volumenPico);
+
+        // ── 3. Cargar envíos del día pico + 2 días siguientes ─────────────────
+        int  anio      = Integer.parseInt(fechaPico.substring(0, 4));
+        int  mes       = Integer.parseInt(fechaPico.substring(4, 6));
+        int  dia       = Integer.parseInt(fechaPico.substring(6, 8));
+        long inicioUTC = GestorDatos.calcularEpochMinutos(anio, mes, dia, 0, 0, 0);
+        long finUTC    = inicioUTC + 3L * 1440L;           // día pico + 2 días
+
+        System.out.printf("%nCargando envíos [UTC %d → %d] (3 días desde pico)...%n",
+                inicioUTC, finUTC);
+        datos.cargarTodosLosEnvios(RUTA_ENVIOS, inicioUTC, finUTC);
+
+        if (datos.numEnvios == 0) {
+            System.err.println("No se encontraron envíos en la ventana del día pico.");
+            return;
+        }
+        int totalCargado = datos.numEnvios;
+        System.out.printf("Envíos disponibles en RAM: %,d%n", totalCargado);
+
+        // ── 4. Estrangular capacidad de vuelos ────────────────────────────────
+        System.out.println("\n--- ESTRANGULAMIENTO DE RED (cap=50 por vuelo) ---");
+        int[] backupCapacidades = datos.respaldarYEstrangularVuelos(50);
+
+        // ── 5. Niveles de inyección de carga progresiva ───────────────────────
+        // Referencia: volumen del día pico (solo los envíos de ese día).
+        // Para niveles > datos disponibles se registra una advertencia.
+        double[] multiplicadores = {0.70, 0.85, 1.00, 1.15, 1.30};
+        String[] etiquetasNivel  = {"-30%", "-15%", "Pico", "+15%", "+30%"};
+
+        // ── 6. Criterios a evaluar ────────────────────────────────────────────
+        CriterioOrden[] criterios  = {
+            CriterioOrden.FIFO,
+            CriterioOrden.EDF,
+            CriterioOrden.ALEATORIO
+        };
+        String[] nombresCriterio = {"GVNS-FIFO", "GVNS-EDF", "GVNS-ALEATORIO"};
+        long     semillaFija     = 42L;   // determinista en FIFO/EDF; base para ALEATORIO
+
+        // ── 7. Preparar CSV (append: escribe cabecera solo si es archivo nuevo) ─
+        String csvRuta = "datos_colapso_davila.csv";
+        boolean esNuevo = !new File(csvRuta).exists();
+        if (esNuevo) {
+            try (PrintWriter pw = new PrintWriter(new FileWriter(csvRuta))) {
+                pw.println("Algoritmo,Volumen_Maletas,Porcentaje_Colapso");
+            } catch (Exception ex) {
+                System.err.println("Error creando CSV: " + ex.getMessage());
+                return;
+            }
+        }
+
+        // ── 8. Bucle principal ────────────────────────────────────────────────
+        System.out.println("\n--- INYECCIÓN DE CARGA PROGRESIVA ---");
+        for (int ni = 0; ni < multiplicadores.length; ni++) {
+            long volObjetivo  = (long)(volumenPico * multiplicadores[ni]);
+            int  volEfectivo  = (int) Math.min(volObjetivo, totalCargado);
+
+            if (volObjetivo > totalCargado) {
+                System.out.printf("%n[AVISO] Nivel %s: objetivo %,d > datos disponibles %,d."
+                        + " Se usará el máximo disponible.%n",
+                        etiquetasNivel[ni], volObjetivo, totalCargado);
+            }
+
+            System.out.printf("%n══════ Nivel %s | %,d envíos ══════%n",
+                    etiquetasNivel[ni], volEfectivo);
+
+            for (int ci = 0; ci < criterios.length; ci++) {
+                CriterioOrden criterio  = criterios[ci];
+                String        nombreAlg = nombresCriterio[ci];
+
+                // Limitar los envíos visibles al planificador para este nivel
+                datos.numEnvios = volEfectivo;
+
+                // Fase 2 + Fase 3
+                PlanificadorGVNSConcurrente plan =
+                        new PlanificadorGVNSConcurrente(datos, semillaFija, criterio);
+                plan.construirSolucionInicial();
+                plan.ejecutarMejoraGVNS();
+
+                // Métricas de colapso
+                int    rechazadosFinales = plan.contarRechazadosActivos();
+                double pctColapso = (rechazadosFinales / (double) volEfectivo) * 100.0;
+
+                System.out.printf("  %-15s | rechazados=%,d | colapso=%.2f%%%n",
+                        nombreAlg, rechazadosFinales, pctColapso);
+
+                // Append al CSV
+                try (PrintWriter pw = new PrintWriter(new FileWriter(csvRuta, true))) {
+                    pw.printf("%s,%d,%.2f%n", nombreAlg, volEfectivo, pctColapso);
+                } catch (Exception ex) {
+                    System.err.println("Error escribiendo CSV: " + ex.getMessage());
+                }
+            }
+        }
+
+        // ── 9. Restaurar estado original ──────────────────────────────────────
+        datos.restaurarCapacidadVuelos(backupCapacidades);
+        datos.numEnvios = totalCargado;
+
+        System.out.printf("%n====================================================");
+        System.out.printf("%n CSV generado: %s%n", new File(csvRuta).getAbsolutePath());
+        System.out.printf("====================================================");
     }
 
     // =========================================================================
