@@ -3,6 +3,8 @@ out/
 !**/src/main/**/out/
 !**/src/test/**/out/
 .kotlin
+.idea/
+*.iml
 
 ### Eclipse ###
 .apt_generated
@@ -32,18 +34,10 @@ bin/
 ### Java compilados ###
 *.class
 
-### Tasf.B2B - Datos Masivos y Resultados ###
-
-# 1. Ignorar la carpeta de datos gigantes (aeropuertos, vuelos, millones de envíos)
-/datos/
-datos/
-/data/
-data/
-
-# 2. Ignorar los reportes de experimentación generados por el Main
-*.csv
+### Resultados locales de simulación ###
+resultados_alns_*.csv
+run_alns*.log
 visualizacion_casos.json
 
-### IntelliJ IDEA (Archivos de proyecto local) ###
-.idea/
-*.iml
+### Reportes generados ###
+*.csv
