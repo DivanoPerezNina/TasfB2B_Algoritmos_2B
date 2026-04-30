@@ -1,7 +1,43 @@
-*.class
-.vscode/
+### IntelliJ IDEA ###
 out/
+!**/src/main/**/out/
+!**/src/test/**/out/
+.kotlin
+.idea/
+*.iml
 
-# Resultados locales de simulación
+### Eclipse ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+bin/
+!**/src/main/**/bin/
+!**/src/test/**/bin/
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+### VS Code ###
+.vscode/
+
+### Mac OS ###
+.DS_Store
+
+### Java compilados ###
+*.class
+
+### Resultados locales de simulación ###
 resultados_alns_*.csv
 run_alns*.log
+visualizacion_casos.json
+
+### Reportes generados ###
+*.csv
