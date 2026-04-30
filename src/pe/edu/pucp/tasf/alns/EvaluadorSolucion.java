@@ -1,75 +1,35 @@
 package pe.edu.pucp.tasf.alns;
-import java.util.*;
 
-/**
- * Clase para evaluar factibilidad y costo de soluciones.
- */
 public class EvaluadorSolucion {
-    private GestorDatos datos;
-    private ConfigExperimentacion config;
-    private Map<String, Integer> capacidadPorVueloId = new HashMap<>();
-    private Map<String, Integer> capacidadPorRuta = new HashMap<>();
+    public static double calcularFitness(ActiveShipmentPool pool, RouteStore routes, long currentTime) {
+        int sinRuta = 0, noFactible = 0, retrasados = 0, pendientes = 0;
+        double minutosRetraso = 0;
+        int saturacionAeropuerto = 0; // Placeholder
+        double transitoTotal = 0;
+        int cambiosRuta = 0; // Placeholder
 
-    public EvaluadorSolucion(GestorDatos datos, ConfigExperimentacion config) {
-        this.datos = datos;
-        this.config = config;
-        inicializarCapacidades();
-    }
-
-    public boolean esFactible(SolucionALNS solucion) {
-        // Verificar capacidad de vuelos
-        for (Map.Entry<String, Integer> entry : solucion.ocupacionVuelos.entrySet()) {
-            String vueloId = entry.getKey().split("_")[0];
-            int ocupado = entry.getValue();
-            int capacidad = obtenerCapacidad(vueloId);
-            if (ocupado > capacidad) return false;
-        }
-        return true;
-    }
-
-    public void actualizarOcupacion(SolucionALNS solucion) {
-        solucion.ocupacionVuelos.clear();
-        solucion.ocupacionAlmacen.clear();
-        for (RutaEnvio r : solucion.rutas) {
-            for (TramoAsignado t : r.tramos) {
-                String key = construirVueloId(t.vuelo) + "_" + t.diaAbsoluto;
-                solucion.ocupacionVuelos.put(key, solucion.ocupacionVuelos.getOrDefault(key, 0) + r.envio.maletas);
-            }
-            // Almacén: simplificar
-            if (!r.tramos.isEmpty()) {
-                String aero = r.tramos.get(0).vuelo.origen;
-                solucion.ocupacionAlmacen.put(aero, solucion.ocupacionAlmacen.getOrDefault(aero, 0) + r.envio.maletas);
+        for (int i = 0; i < pool.getSize(); i++) {
+            byte status = pool.getStatus(i);
+            if (status == ActiveShipmentPool.SIN_RUTA) sinRuta++;
+            else if (status == ActiveShipmentPool.NO_FACTIBLE_ESTRUCTURAL) noFactible++;
+            else if (status == ActiveShipmentPool.RETRASADO) retrasados++;
+            else if (status == ActiveShipmentPool.PENDIENTE) pendientes++;
+            // Calcular retrasos
+            if (routes.getRouteLength(i) > 0) {
+                long arrival = routes.getDepartureUTC(i, routes.getRouteLength(i) - 1) + 60; // Aprox
+                if (arrival > pool.getDeadlineUTC(i)) {
+                    minutosRetraso += arrival - pool.getDeadlineUTC(i);
+                }
             }
         }
-    }
 
-    private void inicializarCapacidades() {
-        for (GestorDatos.Vuelo vuelo : datos.vuelos) {
-            String vueloId = construirVueloId(vuelo);
-            capacidadPorVueloId.put(vueloId, vuelo.capacidad);
-
-            String rutaId = vuelo.origen + "-" + vuelo.destino;
-            int capacidadMax = Math.max(capacidadPorRuta.getOrDefault(rutaId, 0), vuelo.capacidad);
-            capacidadPorRuta.put(rutaId, capacidadMax);
-        }
-    }
-
-    private int obtenerCapacidad(String vueloId) {
-        Integer capacidad = capacidadPorVueloId.get(vueloId);
-        if (capacidad != null) return capacidad;
-
-        String[] partes = vueloId.split("-");
-        if (partes.length >= 2) {
-            String rutaId = partes[0] + "-" + partes[1];
-            Integer capacidadRuta = capacidadPorRuta.get(rutaId);
-            if (capacidadRuta != null) return capacidadRuta;
-        }
-
-        // Fallback conservador para casos no reconocidos.
-        return 100;
-    }
-
-    private String construirVueloId(GestorDatos.Vuelo vuelo) {
-        return vuelo.origen + "-" + vuelo.destino + "-" + vuelo.salidaMinutos + "-" + vuelo.llegadaMinutos;
+        return sinRuta * ConfigExperimentacion.PESO_MUY_ALTO +
+               noFactible * ConfigExperimentacion.PESO_MUY_ALTO +
+               retrasados * ConfigExperimentacion.PESO_ALTO +
+               minutosRetraso * ConfigExperimentacion.PESO_MEDIO +
+               pendientes * ConfigExperimentacion.PESO_MEDIO +
+               saturacionAeropuerto * ConfigExperimentacion.PESO_MEDIO +
+               transitoTotal * ConfigExperimentacion.PESO_BAJO +
+               cambiosRuta * ConfigExperimentacion.PESO_BAJO;
     }
 }

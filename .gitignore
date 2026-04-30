@@ -1,2 +1,7 @@
 *.class
 .vscode/
+out/
+
+# Resultados locales de simulación
+resultados_alns_*.csv
+run_alns*.log
