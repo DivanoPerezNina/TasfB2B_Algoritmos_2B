@@ -341,6 +341,118 @@ public class GestorDatos {
         return registroUTC + (continenteOrigen == continenteDestino ? 1440L : 2880L);
     }
 
+    // =========================================================================
+    // ANÁLISIS DE DÍA PICO Y ESTRANGULAMIENTO DE RED
+    // =========================================================================
+
+    /**
+     * Escanea el directorio de envíos y determina qué fecha calendario tiene
+     * el mayor número de envíos registrados, <b>sin cargar datos en RAM</b>.
+     *
+     * <p>El método lee únicamente el campo de fecha de cada línea (campo 1,
+     * formato YYYYMMDD) para construir un contador por día. Apropiado para
+     * identificar el día pico antes de ejecutar el modo colapso.
+     *
+     * @param rutaDirectorio carpeta con archivos {@code _envios_IATA_.txt}
+     * @return arreglo {@code [fechaYYYYMMDD, conteo]} con el día de mayor
+     *         volumen; {@code null} si no se encontraron datos.
+     */
+    public static String[] encontrarDiaPico(String rutaDirectorio) {
+        Map<String, Long> conteoPorDia = new HashMap<>();
+
+        File carpeta = new File(rutaDirectorio);
+        if (!carpeta.isDirectory()) {
+            System.err.println("Ruta de envíos no es directorio: " + rutaDirectorio);
+            return null;
+        }
+
+        File[] archivos = carpeta.listFiles();
+        if (archivos == null) return null;
+
+        for (File archivo : archivos) {
+            if (!archivo.getName().startsWith("_envios_")
+                    || !archivo.getName().endsWith(".txt")) continue;
+
+            try (BufferedReader br = new BufferedReader(
+                    new InputStreamReader(new FileInputStream(archivo),
+                            StandardCharsets.UTF_8), 65_536)) {
+
+                String linea;
+                while ((linea = br.readLine()) != null) {
+                    linea = linea.trim();
+                    if (linea.isEmpty() || !linea.contains("-")) continue;
+
+                    // Formato: ID-YYYYMMDD-HH-MM-IATA-maletas-cliente
+                    int pri = linea.indexOf('-');
+                    if (pri < 0 || pri + 9 > linea.length()) continue;
+                    String fecha = linea.substring(pri + 1, pri + 9); // 8 chars
+                    if (fecha.length() == 8 && Character.isDigit(fecha.charAt(0))) {
+                        // Sumar maletas (campo 5) en vez de contar registros
+                        long maletas = 1L;
+                        String[] campos = linea.split("-", 7);
+                        if (campos.length >= 6) {
+                            try { maletas = Long.parseLong(campos[5].trim()); }
+                            catch (NumberFormatException ignored) {}
+                        }
+                        conteoPorDia.merge(fecha, maletas, Long::sum);
+                    }
+                }
+            } catch (Exception e) {
+                System.err.println("Error escaneando " + archivo.getName()
+                        + ": " + e.getMessage());
+            }
+        }
+
+        if (conteoPorDia.isEmpty()) return null;
+
+        String diaPico  = null;
+        long   maxConteo = 0;
+        for (Map.Entry<String, Long> e : conteoPorDia.entrySet()) {
+            if (e.getValue() > maxConteo) {
+                maxConteo = e.getValue();
+                diaPico   = e.getKey();
+            }
+        }
+
+        System.out.printf("Día pico detectado: %s | %,d envíos%n", diaPico, maxConteo);
+        return new String[]{diaPico, String.valueOf(maxConteo)};
+    }
+
+    /**
+     * Reduce la capacidad de todos los vuelos al valor indicado y retorna
+     * una copia de los valores originales para poder restaurarlos después.
+     *
+     * <p>Esta es la operación de <b>estrangulamiento de red</b> del modo
+     * colapso. El planificador usa {@code vueloCapacidad} en su check CAS;
+     * reducirlo a un valor bajo (ej. 50) crea el cuello de botella artificial.
+     *
+     * @param nuevaCapacidad capacidad máxima por vuelo (ej. 50).
+     * @return copia de {@code vueloCapacidad} antes del estrangulamiento.
+     */
+    public int[] respaldarYEstrangularVuelos(int nuevaCapacidad) {
+        int[] backup = new int[numVuelos];
+        for (int i = 0; i < numVuelos; i++) {
+            backup[i]        = vueloCapacidad[i];
+            vueloCapacidad[i] = nuevaCapacidad;
+        }
+        System.out.printf("Red estrangulada: %d vuelos → cap máx = %d maletas/vuelo%n",
+                numVuelos, nuevaCapacidad);
+        return backup;
+    }
+
+    /**
+     * Restaura las capacidades de vuelo a los valores guardados por
+     * {@link #respaldarYEstrangularVuelos}.
+     *
+     * @param backup arreglo devuelto por {@link #respaldarYEstrangularVuelos}.
+     */
+    public void restaurarCapacidadVuelos(int[] backup) {
+        for (int i = 0; i < Math.min(numVuelos, backup.length); i++) {
+            vueloCapacidad[i] = backup[i];
+        }
+        System.out.println("Capacidades de vuelo restauradas.");
+    }
+
     public static long calcularEpochMinutos(int anio, int mes, int dia,
                                             int horaLoc, int minLoc, int gmtHoras) {
         // Paso 1: Número de Día Juliano (JDN) de la fecha gregoriana
