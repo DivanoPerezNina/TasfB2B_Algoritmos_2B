@@ -27,6 +27,10 @@ public class PlanificadorALNS {
     }
 
     public ResultadoALNS ejecutarALNS(List<Integer> criticos, long timeLimitMs) {
+        return ejecutarALNS(criticos, timeLimitMs, ConfigExperimentacion.MAX_ITERACIONES_ALNS);
+    }
+
+    public ResultadoALNS ejecutarALNS(List<Integer> criticos, long timeLimitMs, int maxIteraciones) {
         ResultadoALNS resultado = new ResultadoALNS();
         if (criticos == null || criticos.isEmpty()) {
             resultado.llamadasALNS = 0;
@@ -66,7 +70,7 @@ public class PlanificadorALNS {
         long start = System.currentTimeMillis();
         double bestFitness = resultado.fitnessAntesALNS;
         int iter = 0;
-        while (System.currentTimeMillis() - start < timeLimitMs && iter < ConfigExperimentacion.MAX_ITERACIONES_ALNS) {
+        while (System.currentTimeMillis() - start < timeLimitMs && iter < maxIteraciones) {
             OperadorDestroy destroy = seleccionarDestroy();
             OperadorRepair repair = seleccionarRepair();
             List<Integer> removidos = destroyOperacion(destroy, criticos);

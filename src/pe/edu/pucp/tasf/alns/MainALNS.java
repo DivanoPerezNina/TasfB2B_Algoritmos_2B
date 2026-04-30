@@ -11,6 +11,13 @@ import java.util.Map;
 
 public class MainALNS {
 
+    /**
+     * {@code true} → ejecuta el experimento numérico base (3 días, capacidades reales,
+     * 120 s de ALNS) exportando a {@code resultados_3D/}.
+     * Tiene prioridad sobre {@link #MODO_COLAPSO_ALNS}.
+     */
+    private static final boolean MODO_EXPNUM_ALNS = false;
+
     /** {@code true} → ejecuta la prueba de estrés (colapso) en lugar del modo normal. */
     private static final boolean MODO_COLAPSO_ALNS = false;
 
@@ -21,6 +28,15 @@ public class MainALNS {
     private static final long TIEMPO_LIMITE_COLAPSO_MS = 30_000L;
 
     public static void main(String[] args) throws IOException {
+        if (MODO_EXPNUM_ALNS) {
+            try {
+                ejecutarModoNormalALNS();
+            } catch (Exception e) {
+                System.err.println("Error en modo expnum ALNS: " + e.getMessage());
+                e.printStackTrace();
+            }
+            return;
+        }
         if (MODO_COLAPSO_ALNS) {
             try {
                 ejecutarModoColapsoALNS();
@@ -435,6 +451,148 @@ public class MainALNS {
             }
         }
         return retrasados;
+    }
+
+    // =========================================================================
+    // MODO EXPNUM ALNS — Experimento Numérico Base (3 días, capacidades reales)
+    // =========================================================================
+
+    /**
+     * Ejecuta el experimento numérico base del ALNS equivalente al GVNS de 3 días:
+     * capacidades reales, ventana de 3 días desde {@code FECHA_INICIO_AAAAMMDD},
+     * y 120 s de optimización (mismo límite que el GVNS Fase 3).
+     *
+     * <p>Produce dos archivos en {@code resultados_3D/}:
+     * <ul>
+     *   <li>{@code resultados_3dias_ALNS.csv} — métricas finales.</li>
+     *   <li>{@code convergencia_3dias_ALNS.csv} — curva de mejora iteración a iteración.</li>
+     * </ul>
+     *
+     * <p>Para activar: cambiar {@code MODO_EXPNUM_ALNS = true} y compilar.
+     */
+    public static void ejecutarModoNormalALNS() throws Exception {
+        // Mismo tiempo de optimización que el GVNS Fase 3
+        final long TIEMPO_LIMITE_NORMAL_MS = 120_000L;
+        // Sin tope de iteraciones: solo el tiempo límite gobierna
+        final int  MAX_ITER_NORMAL        = Integer.MAX_VALUE;
+
+        System.out.println("======================================================");
+        System.out.println(" EXPNUM ALNS — Experimento Numérico Base (3 días)");
+        System.out.printf ("   Fecha inicio : %d%n", ConfigExperimentacion.FECHA_INICIO_AAAAMMDD);
+        System.out.printf ("   Tiempo ALNS  : %.0f s%n", TIEMPO_LIMITE_NORMAL_MS / 1000.0);
+        System.out.println("======================================================");
+
+        // 1. Cargar red con capacidades reales (sin estrangulamiento)
+        DatosEstaticos.cargarDatos();
+
+        // 2. Ventana de 3 días desde la fecha configurada
+        int fecha   = ConfigExperimentacion.FECHA_INICIO_AAAAMMDD;
+        int anio    = fecha / 10000;
+        int mes     = (fecha / 100) % 100;
+        int dia     = fecha % 100;
+        long inicioUTC = DatosEstaticos.calcularEpochMinutos(anio, mes, dia, 0, 0, 0);
+        long finUTC    = inicioUTC + 3L * 1440L;
+
+        System.out.printf("%nVentana UTC [%d → %d] (3 días)...%n", inicioUTC, finUTC);
+
+        // 3. Cargar TODOS los envíos de la ventana vía streaming (sin cap de volumen)
+        ActiveShipmentPool pool    = new ActiveShipmentPool(50_000);
+        RouteStore         routes  = new RouteStore(50_000);
+        FlightCapacityStore flights = new FlightCapacityStore();
+        AirportCapacityTimeline airports =
+                new AirportCapacityTimeline(DatosEstaticos.airportCode.length);
+
+        int cargados = 0;
+        try (ShipmentStreamManager manager = new ShipmentStreamManager()) {
+            System.out.println("Streams abiertos: " + manager.getStreamsAbiertos());
+            while (manager.hasNextBefore(finUTC)) {
+                ShipmentRecord rec = manager.pollNext();
+                if (rec == null) break;
+                if (rec.releaseUTC < inicioUTC) continue;
+                int idx = pool.addShipment(rec);
+                routes.ensureCapacity(pool.getCapacity());
+                pool.setStatus(idx, ActiveShipmentPool.PENDIENTE);
+                cargados++;
+            }
+        }
+        System.out.printf("Envíos cargados: %,d%n", cargados);
+
+        if (cargados == 0) {
+            System.err.println("No se encontraron envíos en la ventana configurada.");
+            return;
+        }
+
+        // 4. Todos son críticos (sin ruta aún)
+        List<Integer> criticos = new ArrayList<>();
+        for (int i = 0; i < pool.getSize(); i++) criticos.add(i);
+
+        // 5. Ejecutar ALNS durante exactamente 120 s (sin tope de iteraciones)
+        System.out.printf("%nIniciando ALNS (%,d críticos | %.0f s límite)...%n",
+                criticos.size(), TIEMPO_LIMITE_NORMAL_MS / 1000.0);
+        long t0 = System.currentTimeMillis();
+        PlanificadorALNS alns = new PlanificadorALNS(pool, routes, flights, airports);
+        ResultadoALNS resultado = alns.ejecutarALNS(criticos, TIEMPO_LIMITE_NORMAL_MS, MAX_ITER_NORMAL);
+        long tiempoMs = System.currentTimeMillis() - t0;
+
+        // 6. Métricas finales
+        int exitosos = 0, rechazadosFinales = 0;
+        long transitoMin = 0;
+        for (int i = 0; i < pool.getSize(); i++) {
+            byte s = pool.getStatus(i);
+            if (s == ActiveShipmentPool.ENTREGADO) {
+                exitosos++;
+                int rLen = routes.getRouteLength(i);
+                if (rLen > 0) {
+                    int fl   = routes.getFlightId(i, rLen - 1);
+                    long dep = routes.getDepartureUTC(i, rLen - 1);
+                    int durMin = DatosEstaticos.flightArrivalUTCMinuteOfDay[fl]
+                               - DatosEstaticos.flightDepartureUTCMinuteOfDay[fl];
+                    if (durMin <= 0) durMin += 1440;
+                    transitoMin += (dep + durMin) - pool.getReleaseUTC(i);
+                }
+            } else {
+                rechazadosFinales++;
+            }
+        }
+
+        System.out.printf("Exitosos: %,d | Rechazados: %,d | Iteraciones: %d | Tiempo: %.1f s%n",
+                exitosos, rechazadosFinales, resultado.iteraciones, tiempoMs / 1000.0);
+
+        // 7. Exportar
+        new File("resultados_3D").mkdirs();
+        exportarResultadosNormalALNS(
+                "resultados_3D/resultados_3dias_ALNS.csv",
+                cargados, exitosos, rechazadosFinales, transitoMin,
+                tiempoMs / 1000.0, resultado);
+        exportarConvergenciaColapsoALNS(
+                "resultados_3D/convergencia_3dias_ALNS.csv",
+                resultado);
+
+        System.out.println("\n====== EXPNUM ALNS COMPLETADO ======");
+        System.out.println("  resultados_3D/resultados_3dias_ALNS.csv");
+        System.out.println("  resultados_3D/convergencia_3dias_ALNS.csv");
+    }
+
+    /** Exporta las métricas del experimento normal (mismo esquema que el GVNS). */
+    private static void exportarResultadosNormalALNS(String archivo, int totalEnvios,
+            int exitosos, int rechazados, long transitoMin,
+            double tiempoS, ResultadoALNS resultado) {
+        try (PrintWriter pw = new PrintWriter(new FileWriter(archivo))) {
+            double tasa = totalEnvios > 0 ? exitosos * 100.0 / totalEnvios : 0;
+            pw.println("Metrica,Valor");
+            pw.println("Total Envios,"         + totalEnvios);
+            pw.println("Exitosos Total,"        + exitosos);
+            pw.println("Salvados ALNS,"         + resultado.reparados);
+            pw.println("Rechazados Finales,"    + rechazados);
+            pw.println("Transito Final (min),"  + transitoMin);
+            pw.println("Tiempo ALNS (s),"       + String.format("%.3f", tiempoS));
+            pw.println("Iteraciones ALNS,"      + resultado.iteraciones);
+            pw.println("Mejor FO,"              + (long) resultado.fitnessDespuesALNS);
+            pw.println("Tasa Exito Final (%),"  + String.format("%.4f", tasa));
+            System.out.println("Resultados exportados: " + archivo);
+        } catch (Exception ex) {
+            System.err.println("Error exportando resultados normales: " + ex.getMessage());
+        }
     }
 
     // =========================================================================
