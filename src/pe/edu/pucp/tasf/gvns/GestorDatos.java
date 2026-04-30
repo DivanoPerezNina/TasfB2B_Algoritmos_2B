@@ -387,7 +387,14 @@ public class GestorDatos {
                     if (pri < 0 || pri + 9 > linea.length()) continue;
                     String fecha = linea.substring(pri + 1, pri + 9); // 8 chars
                     if (fecha.length() == 8 && Character.isDigit(fecha.charAt(0))) {
-                        conteoPorDia.merge(fecha, 1L, Long::sum);
+                        // Sumar maletas (campo 5) en vez de contar registros
+                        long maletas = 1L;
+                        String[] campos = linea.split("-", 7);
+                        if (campos.length >= 6) {
+                            try { maletas = Long.parseLong(campos[5].trim()); }
+                            catch (NumberFormatException ignored) {}
+                        }
+                        conteoPorDia.merge(fecha, maletas, Long::sum);
                     }
                 }
             } catch (Exception e) {

@@ -44,6 +44,9 @@ public class Main {
      */
     private static final boolean MODO_EXPNUM = true;
 
+    /** Capacidad máxima por vuelo durante el estrangulamiento de red. */
+    private static final int CAP_ESTRANGULAMIENTO = 50;
+
     /** Escenario activo. Solo aplica cuando {@code MODO_EXPNUM = false}. */
     private static final Escenario ESCENARIO = Escenario.PERIODO_3D;
 
@@ -164,19 +167,20 @@ public class Main {
             System.err.println("No se pudo determinar el día pico.");
             return;
         }
-        String fechaPico   = pico[0];                      // "YYYYMMDD"
-        long   volumenPico = Long.parseLong(pico[1]);
+        String fechaPico    = pico[0];                     // "YYYYMMDD"
+        long   maletasPico  = Long.parseLong(pico[1]);    // total maletas del día pico
 
         System.out.printf("Día pico : %s/%s/%s%n",
                 fechaPico.substring(6), fechaPico.substring(4, 6), fechaPico.substring(0, 4));
-        System.out.printf("Volumen  : %,d envíos%n", volumenPico);
+        System.out.printf("Volumen  : %,d maletas%n", maletasPico);
 
         // ── 3. Cargar envíos del día pico + 2 días siguientes ─────────────────
+        // Los 2 días extra proveen datos para los niveles +15% y +30%.
         int  anio      = Integer.parseInt(fechaPico.substring(0, 4));
         int  mes       = Integer.parseInt(fechaPico.substring(4, 6));
         int  dia       = Integer.parseInt(fechaPico.substring(6, 8));
         long inicioUTC = GestorDatos.calcularEpochMinutos(anio, mes, dia, 0, 0, 0);
-        long finUTC    = inicioUTC + 3L * 1440L;           // día pico + 2 días
+        long finUTC    = inicioUTC + 3L * 1440L;
 
         System.out.printf("%nCargando envíos [UTC %d → %d] (3 días desde pico)...%n",
                 inicioUTC, finUTC);
@@ -187,77 +191,78 @@ public class Main {
             return;
         }
         int totalCargado = datos.numEnvios;
-        System.out.printf("Envíos disponibles en RAM: %,d%n", totalCargado);
+
+        // Contar los envíos que pertenecen únicamente al día pico (≤ 1440 min)
+        // — este número es la referencia del 100% para la inyección progresiva.
+        long finPicoDia    = inicioUTC + 1440L;
+        int  enviosPicoDia = 0;
+        for (int i = 0; i < totalCargado; i++) {
+            if (datos.envioRegistroUTC[i] < finPicoDia) enviosPicoDia++;
+        }
+        System.out.printf("Envíos en el día pico (24 h)     : %,d%n", enviosPicoDia);
+        System.out.printf("Envíos totales cargados (3 días) : %,d%n", totalCargado);
 
         // ── 4. Estrangular capacidad de vuelos ────────────────────────────────
-        System.out.println("\n--- ESTRANGULAMIENTO DE RED (cap=50 por vuelo) ---");
-        int[] backupCapacidades = datos.respaldarYEstrangularVuelos(50);
+        System.out.println("\n--- ESTRANGULAMIENTO DE RED ---");
+        int[] backupCapacidades = datos.respaldarYEstrangularVuelos(CAP_ESTRANGULAMIENTO);
 
-        // ── 5. Niveles de inyección de carga progresiva ───────────────────────
-        // Referencia: volumen del día pico (solo los envíos de ese día).
-        // Para niveles > datos disponibles se registra una advertencia.
+        // ── 5. Niveles de inyección (porcentaje del día pico) ─────────────────
         double[] multiplicadores = {0.70, 0.85, 1.00, 1.15, 1.30};
         String[] etiquetasNivel  = {"-30%", "-15%", "Pico", "+15%", "+30%"};
 
         // ── 6. Criterios a evaluar ────────────────────────────────────────────
-        CriterioOrden[] criterios  = {
-            CriterioOrden.FIFO,
-            CriterioOrden.EDF,
-            CriterioOrden.ALEATORIO
-        };
-        String[] nombresCriterio = {"GVNS-FIFO", "GVNS-EDF", "GVNS-ALEATORIO"};
-        long     semillaFija     = 42L;   // determinista en FIFO/EDF; base para ALEATORIO
+        CriterioOrden[] criterios    = {CriterioOrden.FIFO, CriterioOrden.EDF, CriterioOrden.ALEATORIO};
+        String[]        nombresCrit  = {"GVNS-FIFO", "GVNS-EDF", "GVNS-ALEATORIO"};
+        long            semillaFija  = 42L;
 
-        // ── 7. Preparar CSV (append: escribe cabecera solo si es archivo nuevo) ─
+        // ── 7. Inicializar CSV (siempre fresco al inicio del modo colapso) ────
         String csvRuta = "datos_colapso_davila.csv";
-        boolean esNuevo = !new File(csvRuta).exists();
-        if (esNuevo) {
-            try (PrintWriter pw = new PrintWriter(new FileWriter(csvRuta))) {
-                pw.println("Algoritmo,Volumen_Maletas,Porcentaje_Colapso");
-            } catch (Exception ex) {
-                System.err.println("Error creando CSV: " + ex.getMessage());
-                return;
-            }
+        try (PrintWriter pw = new PrintWriter(new FileWriter(csvRuta, false))) {
+            pw.println("Algoritmo,Volumen_Maletas,Porcentaje_Colapso");
+        } catch (Exception ex) {
+            System.err.println("Error creando CSV: " + ex.getMessage());
+            datos.restaurarCapacidadVuelos(backupCapacidades);
+            return;
         }
 
         // ── 8. Bucle principal ────────────────────────────────────────────────
         System.out.println("\n--- INYECCIÓN DE CARGA PROGRESIVA ---");
         for (int ni = 0; ni < multiplicadores.length; ni++) {
-            long volObjetivo  = (long)(volumenPico * multiplicadores[ni]);
-            int  volEfectivo  = (int) Math.min(volObjetivo, totalCargado);
+            // Número de envíos a inyectar = fracción de los envíos del día pico.
+            // Los niveles >100% usan datos de los días 2-3 ya cargados.
+            int volEfectivo = (int) Math.round(enviosPicoDia * multiplicadores[ni]);
+            volEfectivo = Math.max(1, Math.min(volEfectivo, totalCargado));
 
-            if (volObjetivo > totalCargado) {
-                System.out.printf("%n[AVISO] Nivel %s: objetivo %,d > datos disponibles %,d."
-                        + " Se usará el máximo disponible.%n",
-                        etiquetasNivel[ni], volObjetivo, totalCargado);
+            if (volEfectivo < (int)(enviosPicoDia * multiplicadores[ni])) {
+                System.out.printf("%n[AVISO] Nivel %s: se usará el máximo disponible (%,d envíos).%n",
+                        etiquetasNivel[ni], volEfectivo);
             }
 
-            System.out.printf("%n══════ Nivel %s | %,d envíos ══════%n",
-                    etiquetasNivel[ni], volEfectivo);
+            // Calcular maletas reales del slice (columna CSV Volumen_Maletas)
+            long malevasEfectivas = 0;
+            for (int i = 0; i < volEfectivo; i++) malevasEfectivas += datos.envioMaletas[i];
+
+            System.out.printf("%n══════ Nivel %s (%.0f%%) | %,d envíos | %,d maletas ══════%n",
+                    etiquetasNivel[ni], multiplicadores[ni] * 100, volEfectivo, malevasEfectivas);
 
             for (int ci = 0; ci < criterios.length; ci++) {
-                CriterioOrden criterio  = criterios[ci];
-                String        nombreAlg = nombresCriterio[ci];
+                String nombreAlg = nombresCrit[ci];
 
-                // Limitar los envíos visibles al planificador para este nivel
                 datos.numEnvios = volEfectivo;
 
-                // Fase 2 + Fase 3
                 PlanificadorGVNSConcurrente plan =
-                        new PlanificadorGVNSConcurrente(datos, semillaFija, criterio);
+                        new PlanificadorGVNSConcurrente(datos, semillaFija, criterios[ci]);
                 plan.construirSolucionInicial();
                 plan.ejecutarMejoraGVNS();
 
-                // Métricas de colapso
-                int    rechazadosFinales = plan.contarRechazadosActivos();
-                double pctColapso = (rechazadosFinales / (double) volEfectivo) * 100.0;
+                int    rechazados = plan.contarRechazadosActivos();
+                double pctColapso = rechazados * 100.0 / volEfectivo;
 
                 System.out.printf("  %-15s | rechazados=%,d | colapso=%.2f%%%n",
-                        nombreAlg, rechazadosFinales, pctColapso);
+                        nombreAlg, rechazados, pctColapso);
 
-                // Append al CSV
                 try (PrintWriter pw = new PrintWriter(new FileWriter(csvRuta, true))) {
-                    pw.printf("%s,%d,%.2f%n", nombreAlg, volEfectivo, pctColapso);
+                    pw.printf("%s,%d,%.2f%n", nombreAlg, malevasEfectivas, pctColapso);
                 } catch (Exception ex) {
                     System.err.println("Error escribiendo CSV: " + ex.getMessage());
                 }
