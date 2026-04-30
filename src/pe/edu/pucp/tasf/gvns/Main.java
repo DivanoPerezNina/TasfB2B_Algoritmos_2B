@@ -215,12 +215,14 @@ public class Main {
         String[]        nombresCrit  = {"GVNS-FIFO", "GVNS-EDF", "GVNS-ALEATORIO"};
         long            semillaFija  = 42L;
 
-        // ── 7. Inicializar CSV (siempre fresco al inicio del modo colapso) ────
-        String csvRuta = "datos_colapso_davila.csv";
-        try (PrintWriter pw = new PrintWriter(new FileWriter(csvRuta, false))) {
+        // ── 7. Carpeta de salida + CSV resumen ────────────────────────────────
+        String carpeta = "resultados_colapso";
+        new File(carpeta).mkdirs();
+        String csvResumen = carpeta + "/datos_colapso_davila.csv";
+        try (PrintWriter pw = new PrintWriter(new FileWriter(csvResumen, false))) {
             pw.println("Algoritmo,Volumen_Maletas,Porcentaje_Colapso");
         } catch (Exception ex) {
-            System.err.println("Error creando CSV: " + ex.getMessage());
+            System.err.println("Error creando CSV resumen: " + ex.getMessage());
             datos.restaurarCapacidadVuelos(backupCapacidades);
             return;
         }
@@ -228,8 +230,6 @@ public class Main {
         // ── 8. Bucle principal ────────────────────────────────────────────────
         System.out.println("\n--- INYECCIÓN DE CARGA PROGRESIVA ---");
         for (int ni = 0; ni < multiplicadores.length; ni++) {
-            // Número de envíos a inyectar = fracción de los envíos del día pico.
-            // Los niveles >100% usan datos de los días 2-3 ya cargados.
             int volEfectivo = (int) Math.round(enviosPicoDia * multiplicadores[ni]);
             volEfectivo = Math.max(1, Math.min(volEfectivo, totalCargado));
 
@@ -238,22 +238,31 @@ public class Main {
                         etiquetasNivel[ni], volEfectivo);
             }
 
-            // Calcular maletas reales del slice (columna CSV Volumen_Maletas)
             long malevasEfectivas = 0;
             for (int i = 0; i < volEfectivo; i++) malevasEfectivas += datos.envioMaletas[i];
+
+            // Etiqueta numérica para nombres de archivo: 70, 85, 100, 115, 130
+            int nivelPct = (int) Math.round(multiplicadores[ni] * 100);
 
             System.out.printf("%n══════ Nivel %s (%.0f%%) | %,d envíos | %,d maletas ══════%n",
                     etiquetasNivel[ni], multiplicadores[ni] * 100, volEfectivo, malevasEfectivas);
 
             for (int ci = 0; ci < criterios.length; ci++) {
                 String nombreAlg = nombresCrit[ci];
+                String sufijo    = criterios[ci].name() + "_" + nivelPct;
 
                 datos.numEnvios = volEfectivo;
 
+                long t0 = System.currentTimeMillis();
                 PlanificadorGVNSConcurrente plan =
                         new PlanificadorGVNSConcurrente(datos, semillaFija, criterios[ci]);
                 plan.construirSolucionInicial();
-                plan.ejecutarMejoraGVNS();
+                long fGreedy     = plan.calcularTransitoTotal();
+                double tGreedy   = (System.currentTimeMillis() - t0) / 1000.0;
+
+                long t1 = System.currentTimeMillis();
+                int salvados     = plan.ejecutarMejoraGVNS();
+                double tGVNS     = (System.currentTimeMillis() - t1) / 1000.0;
 
                 int    rechazados = plan.contarRechazadosActivos();
                 double pctColapso = rechazados * 100.0 / volEfectivo;
@@ -261,10 +270,18 @@ public class Main {
                 System.out.printf("  %-15s | rechazados=%,d | colapso=%.2f%%%n",
                         nombreAlg, rechazados, pctColapso);
 
-                try (PrintWriter pw = new PrintWriter(new FileWriter(csvRuta, true))) {
+                // Mismo formato que expnum: resultados detallados + convergencia
+                plan.exportarResultadosCSV(
+                        carpeta + "/resultados_colapso_" + sufijo + ".csv",
+                        fGreedy, tGreedy, tGVNS, salvados);
+                plan.exportarHistorialConvergenciaCSV(
+                        carpeta + "/convergencia_colapso_" + sufijo + ".csv");
+
+                // Append al resumen agregado
+                try (PrintWriter pw = new PrintWriter(new FileWriter(csvResumen, true))) {
                     pw.printf("%s,%d,%.2f%n", nombreAlg, malevasEfectivas, pctColapso);
                 } catch (Exception ex) {
-                    System.err.println("Error escribiendo CSV: " + ex.getMessage());
+                    System.err.println("Error escribiendo CSV resumen: " + ex.getMessage());
                 }
             }
         }
@@ -273,9 +290,12 @@ public class Main {
         datos.restaurarCapacidadVuelos(backupCapacidades);
         datos.numEnvios = totalCargado;
 
-        System.out.printf("%n====================================================");
-        System.out.printf("%n CSV generado: %s%n", new File(csvRuta).getAbsolutePath());
-        System.out.printf("====================================================");
+        System.out.printf("%n====================================================%n");
+        System.out.printf(" Resultados en: %s/%n", new File(carpeta).getAbsolutePath());
+        System.out.printf("   %-42s ← resumen R%n", "datos_colapso_davila.csv");
+        System.out.printf("   resultados_colapso_CRITERIO_NIVEL.csv  ← detalle por run%n");
+        System.out.printf("   convergencia_colapso_CRITERIO_NIVEL.csv ← curvas%n");
+        System.out.printf("====================================================%n");
     }
 
     // =========================================================================
