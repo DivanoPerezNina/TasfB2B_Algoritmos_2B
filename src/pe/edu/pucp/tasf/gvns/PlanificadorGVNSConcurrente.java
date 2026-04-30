@@ -1550,16 +1550,18 @@ public class PlanificadorGVNSConcurrente {
                                       int    salvadosGVNS) {
         try (PrintWriter pw = new PrintWriter(new FileWriter(nombreArchivo))) {
             pw.println("Metrica,Valor");
+            int rechazadosFinales = contarRechazadosActivos();
+            int exitososFinales   = tablero.numEnvios - rechazadosFinales;
+            double tasa = exitososFinales * 100.0 / tablero.numEnvios;
             pw.println("Total Envios,"           + tablero.numEnvios);
-            pw.println("Exitosos Total,"          + enviosExitosos.get());
+            pw.println("Exitosos Total,"          + exitososFinales);
             pw.println("Rechazados Iniciales,"    + totalRechazados);
             pw.println("Salvados GVNS (N1+N2),"   + salvadosGVNS);
-            pw.println("Rechazados Finales,"       + contarRechazadosActivos());
+            pw.println("Rechazados Finales,"       + rechazadosFinales);
             pw.println("Transito Fase2 (min),"     + transitoFase2);
             pw.println("Transito Final (min),"     + calcularTransitoTotal());
             pw.println("Tiempo Greedy (s),"        + tiempoGreedy);
             pw.println("Tiempo GVNS (s),"          + tiempoGVNS);
-            double tasa = (enviosExitosos.get() / (double) tablero.numEnvios) * 100.0;
             pw.println("Tasa Exito Final (%),"    + String.format("%.4f", tasa));
             System.out.println("Resultados exportados: " + nombreArchivo);
         } catch (Exception ex) {
