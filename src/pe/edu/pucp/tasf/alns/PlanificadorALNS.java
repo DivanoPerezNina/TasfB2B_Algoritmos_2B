@@ -61,6 +61,7 @@ public class PlanificadorALNS {
         }
         resultado.criticosAntes = resultado.sinRutaAntes + resultado.pendientesAntes + resultado.retrasadosAntes;
         resultado.fitnessAntesALNS = EvaluadorSolucion.calcularFitness(pool, routes, 0);
+        resultado.convergencia = new ArrayList<>();
 
         long start = System.currentTimeMillis();
         double bestFitness = resultado.fitnessAntesALNS;
@@ -84,6 +85,8 @@ public class PlanificadorALNS {
             } else {
                 actualizarPesos(destroy, repair, -1);
             }
+            long msActual = System.currentTimeMillis() - start;
+            resultado.convergencia.add(new long[]{iter + 1, msActual, (long) bestFitness});
             iter++;
         }
 

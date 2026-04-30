@@ -1,11 +1,35 @@
 package pe.edu.pucp.tasf.alns;
 
+import java.io.File;
+import java.io.FileWriter;
 import java.io.IOException;
+import java.io.PrintWriter;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class MainALNS {
+
+    /** {@code true} → ejecuta la prueba de estrés (colapso) en lugar del modo normal. */
+    private static final boolean MODO_COLAPSO_ALNS = false;
+
+    /** Capacidad forzada por vuelo en el modo colapso (maletas). */
+    private static final int CAP_ESTRANGULAMIENTO = 2;
+
+    /** Tiempo límite del ALNS en el modo colapso (ms). */
+    private static final long TIEMPO_LIMITE_COLAPSO_MS = 30_000L;
+
     public static void main(String[] args) throws IOException {
+        if (MODO_COLAPSO_ALNS) {
+            try {
+                ejecutarModoColapsoALNS();
+            } catch (Exception e) {
+                System.err.println("Error en modo colapso ALNS: " + e.getMessage());
+                e.printStackTrace();
+            }
+            return;
+        }
         // Cargar datos
         DatosEstaticos.cargarDatos();
 
@@ -411,5 +435,233 @@ public class MainALNS {
             }
         }
         return retrasados;
+    }
+
+    // =========================================================================
+    // MODO COLAPSO ALNS — Prueba de Estrés
+    // =========================================================================
+
+    /**
+     * Ejecuta la prueba de estrés del ALNS con los mismos 5 niveles de carga
+     * que el GVNS, exportando archivos compatibles con los scripts R.
+     *
+     * <p>Para activar: cambiar {@code MODO_COLAPSO_ALNS = true} y compilar.</p>
+     */
+    public static void ejecutarModoColapsoALNS() throws Exception {
+        System.out.println("======================================================");
+        System.out.println(" MODO COLAPSO ALNS — Prueba de Estrés de la Red");
+        System.out.println("======================================================");
+
+        // 1. Cargar red (aeropuertos + vuelos)
+        DatosEstaticos.cargarDatos();
+
+        // 2. Forzar capacidad = CAP_ESTRANGULAMIENTO en todos los vuelos
+        for (int f = 0; f < DatosEstaticos.numFlights; f++) {
+            DatosEstaticos.flightCapacity[f] = CAP_ESTRANGULAMIENTO;
+        }
+        System.out.printf("Red estrangulada: %d vuelos × cap=%d%n",
+                DatosEstaticos.numFlights, CAP_ESTRANGULAMIENTO);
+
+        // 3. Encontrar día pico escaneando todos los streams
+        long[] pico = encontrarDiaPicoALNS();
+        long inicioPico = pico[0];   // inicio del día pico en UTC minutos
+        long maletasPico = pico[1];  // maletas totales ese día
+        System.out.printf("Día pico: UTC %d | Maletas: %,d%n", inicioPico, maletasPico);
+
+        // 4. Contar envíos (registros) en ese día — es la referencia 100%
+        long enviosPicoDia = contarEnviosPicoDia(inicioPico, inicioPico + 1440L);
+        System.out.printf("Envíos (registros) en día pico: %,d%n", enviosPicoDia);
+
+        long fin3Dias = inicioPico + 3L * 1440L;
+
+        // 5. Niveles de carga
+        double[] factores  = {1.00, 1.15, 1.30, 1.50, 2.00};
+        String[] etiquetas = {"100", "115", "130", "150", "200"};
+
+        // 6. Carpeta de salida y CSV resumen (append sobre el existente del GVNS)
+        new File("resultados_colapso").mkdirs();
+        String archivoDatos = "resultados_colapso/datos_colapso_davila.csv";
+
+        // 7. Iterar sobre niveles
+        for (int lv = 0; lv < factores.length; lv++) {
+            int targetEnvios = (int) Math.round(enviosPicoDia * factores[lv]);
+            String et = etiquetas[lv];
+
+            System.out.printf("%n--- Nivel %s (+%.0f%%) | target: %,d envíos ---%n",
+                    et, (factores[lv] - 1.0) * 100, targetEnvios);
+
+            // Estructuras frescas por nivel
+            int poolSize = Math.max(targetEnvios + 5000, 10000);
+            ActiveShipmentPool pool = new ActiveShipmentPool(poolSize);
+            RouteStore routes = new RouteStore(poolSize);
+            FlightCapacityStore flights = new FlightCapacityStore();
+            AirportCapacityTimeline airports =
+                    new AirportCapacityTimeline(DatosEstaticos.airportCode.length);
+
+            // Cargar envíos vía streaming (3-day window, cap en targetEnvios)
+            int cargados = 0;
+            try (ShipmentStreamManager manager = new ShipmentStreamManager()) {
+                while (manager.hasNextBefore(fin3Dias) && cargados < targetEnvios) {
+                    ShipmentRecord rec = manager.pollNext();
+                    if (rec == null) break;
+                    if (rec.releaseUTC < inicioPico) continue;
+                    int idx = pool.addShipment(rec);
+                    routes.ensureCapacity(pool.getCapacity());
+                    pool.setStatus(idx, ActiveShipmentPool.PENDIENTE);
+                    cargados++;
+                }
+            }
+            System.out.printf("  Cargados: %,d envíos%n", cargados);
+
+            // Todos los envíos son críticos (aún sin ruta)
+            List<Integer> criticos = new ArrayList<>();
+            for (int i = 0; i < pool.getSize(); i++) criticos.add(i);
+
+            // Ejecutar ALNS con límite de 30 s
+            long t0 = System.currentTimeMillis();
+            PlanificadorALNS alns = new PlanificadorALNS(pool, routes, flights, airports);
+            ResultadoALNS resultado = alns.ejecutarALNS(criticos, TIEMPO_LIMITE_COLAPSO_MS);
+            long tiempoMs = System.currentTimeMillis() - t0;
+
+            // Métricas finales
+            int exitosos = 0, rechazadosFinales = 0;
+            long transitoMin = 0;
+            for (int i = 0; i < pool.getSize(); i++) {
+                byte s = pool.getStatus(i);
+                if (s == ActiveShipmentPool.ENTREGADO) {
+                    exitosos++;
+                    int rLen = routes.getRouteLength(i);
+                    if (rLen > 0) {
+                        int fl  = routes.getFlightId(i, rLen - 1);
+                        long dep = routes.getDepartureUTC(i, rLen - 1);
+                        int durMin = DatosEstaticos.flightArrivalUTCMinuteOfDay[fl]
+                                   - DatosEstaticos.flightDepartureUTCMinuteOfDay[fl];
+                        if (durMin <= 0) durMin += 1440;
+                        transitoMin += (dep + durMin) - pool.getReleaseUTC(i);
+                    }
+                } else {
+                    rechazadosFinales++;
+                }
+            }
+            double pctColapso = cargados > 0 ? rechazadosFinales * 100.0 / cargados : 0;
+
+            System.out.printf("  Exitosos: %,d | Rechazados: %,d | Colapso: %.2f%%%n",
+                    exitosos, rechazadosFinales, pctColapso);
+            System.out.printf("  Iteraciones ALNS: %d | Tiempo: %.1f s%n",
+                    resultado.iteraciones, tiempoMs / 1000.0);
+
+            // Exportar archivos
+            exportarResultadosColapsoALNS(
+                    "resultados_colapso/resultados_colapso_ALNS_" + et + ".csv",
+                    cargados, exitosos, rechazadosFinales, transitoMin,
+                    tiempoMs / 1000.0, resultado);
+            exportarConvergenciaColapsoALNS(
+                    "resultados_colapso/convergencia_colapso_ALNS_" + et + ".csv",
+                    resultado);
+            appendResumenColapso(archivoDatos, "ALNS", cargados, pctColapso);
+        }
+
+        System.out.println("\n====== MODO COLAPSO ALNS COMPLETADO ======");
+        System.out.println("Archivos en: resultados_colapso/");
+    }
+
+    /**
+     * Escanea todos los streams de envíos y devuelve el inicio UTC del día
+     * con mayor volumen de maletas, junto con dicho volumen.
+     *
+     * @return {@code long[]{inicioDiaPicoUTC, maletasPico}}
+     */
+    private static long[] encontrarDiaPicoALNS() throws IOException {
+        System.out.println("Buscando día pico (scan streaming — puede tardar)...");
+        Map<Long, Long> maletasPorDia = new HashMap<>();
+        try (ShipmentStreamManager manager = new ShipmentStreamManager()) {
+            while (manager.hasNext()) {
+                ShipmentRecord rec = manager.pollNext();
+                if (rec == null) continue;
+                long dia = rec.releaseUTC / 1440L;
+                maletasPorDia.merge(dia, (long) rec.quantity, Long::sum);
+            }
+        }
+        if (maletasPorDia.isEmpty()) {
+            throw new RuntimeException("No se encontraron envíos en los archivos de streaming.");
+        }
+        long peakDay = maletasPorDia.entrySet().stream()
+                .max(Map.Entry.comparingByValue())
+                .orElseThrow().getKey();
+        long maletasPico = maletasPorDia.get(peakDay);
+        System.out.printf("Día pico: día %d desde epoch | Maletas: %,d%n", peakDay, maletasPico);
+        return new long[]{peakDay * 1440L, maletasPico};
+    }
+
+    /**
+     * Cuenta cuántos registros (envíos individuales) tienen releaseUTC en
+     * {@code [inicioUTC, finUTC)}, usando streaming sin cargar en memoria.
+     */
+    private static long contarEnviosPicoDia(long inicioUTC, long finUTC) throws IOException {
+        long count = 0;
+        try (ShipmentStreamManager manager = new ShipmentStreamManager()) {
+            while (manager.hasNextBefore(finUTC)) {
+                ShipmentRecord rec = manager.pollNext();
+                if (rec == null) break;
+                if (rec.releaseUTC >= inicioUTC) count++;
+            }
+        }
+        return count;
+    }
+
+    /** Exporta el archivo de detalles por nivel (formato idéntico al GVNS). */
+    private static void exportarResultadosColapsoALNS(String archivo, int totalEnvios,
+            int exitosos, int rechazados, long transitoMin,
+            double tiempoS, ResultadoALNS resultado) {
+        try (PrintWriter pw = new PrintWriter(new FileWriter(archivo))) {
+            pw.println("Metrica,Valor");
+            pw.println("Total Envios,"             + totalEnvios);
+            pw.println("Exitosos Total,"            + exitosos);
+            pw.println("Rechazados Finales,"        + rechazados);
+            pw.println("Transito Final (min),"      + transitoMin);
+            pw.println("Tiempo ALNS (s),"           + String.format("%.3f", tiempoS));
+            pw.println("Iteraciones ALNS,"          + resultado.iteraciones);
+            pw.println("Criticos Antes ALNS,"       + resultado.criticosAntes);
+            pw.println("Criticos Despues ALNS,"     + resultado.criticosDespues);
+            pw.println("Reparados ALNS,"            + resultado.reparados);
+            double tasa = totalEnvios > 0 ? exitosos * 100.0 / totalEnvios : 0;
+            pw.println("Tasa Exito Final (%),"      + String.format("%.4f", tasa));
+            System.out.println("Resultados exportados: " + archivo);
+        } catch (Exception ex) {
+            System.err.println("Error exportando resultados: " + ex.getMessage());
+        }
+    }
+
+    /** Exporta la curva de convergencia del ALNS (formato idéntico al GVNS). */
+    private static void exportarConvergenciaColapsoALNS(String archivo, ResultadoALNS resultado) {
+        try (PrintWriter pw = new PrintWriter(new FileWriter(archivo))) {
+            pw.println("iteracion,ms_transcurridos,mejor_fitness");
+            if (resultado.convergencia != null) {
+                for (long[] row : resultado.convergencia) {
+                    pw.printf("%d,%d,%d%n", row[0], row[1], row[2]);
+                }
+            }
+            System.out.println("Convergencia exportada: " + archivo);
+        } catch (Exception ex) {
+            System.err.println("Error exportando convergencia: " + ex.getMessage());
+        }
+    }
+
+    /**
+     * Agrega una fila al CSV resumen compartido con el GVNS.
+     * Si el archivo no existe o está vacío, escribe el encabezado.
+     */
+    private static void appendResumenColapso(String archivo, String algoritmo,
+            int volumen, double pctColapso) {
+        try {
+            File f = new File(archivo);
+            boolean escribirHeader = !f.exists() || f.length() == 0;
+            try (PrintWriter pw = new PrintWriter(new FileWriter(archivo, true))) {
+                if (escribirHeader) pw.println("Algoritmo,Volumen_Maletas,Porcentaje_Colapso");
+                pw.printf("%s,%d,%.2f%n", algoritmo, volumen, pctColapso);
+            }
+        } catch (Exception ex) {
+            System.err.println("Error escribiendo resumen: " + ex.getMessage());
+        }
     }
 }
