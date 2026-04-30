@@ -27,6 +27,10 @@ public class PlanificadorALNS {
     }
 
     public ResultadoALNS ejecutarALNS(List<Integer> criticos, long timeLimitMs) {
+        return ejecutarALNS(criticos, timeLimitMs, ConfigExperimentacion.MAX_ITERACIONES_ALNS);
+    }
+
+    public ResultadoALNS ejecutarALNS(List<Integer> criticos, long timeLimitMs, int maxIteraciones) {
         ResultadoALNS resultado = new ResultadoALNS();
         if (criticos == null || criticos.isEmpty()) {
             resultado.llamadasALNS = 0;
@@ -61,11 +65,12 @@ public class PlanificadorALNS {
         }
         resultado.criticosAntes = resultado.sinRutaAntes + resultado.pendientesAntes + resultado.retrasadosAntes;
         resultado.fitnessAntesALNS = EvaluadorSolucion.calcularFitness(pool, routes, 0);
+        resultado.convergencia = new ArrayList<>();
 
         long start = System.currentTimeMillis();
         double bestFitness = resultado.fitnessAntesALNS;
         int iter = 0;
-        while (System.currentTimeMillis() - start < timeLimitMs && iter < ConfigExperimentacion.MAX_ITERACIONES_ALNS) {
+        while (System.currentTimeMillis() - start < timeLimitMs && iter < maxIteraciones) {
             OperadorDestroy destroy = seleccionarDestroy();
             OperadorRepair repair = seleccionarRepair();
             List<Integer> removidos = destroyOperacion(destroy, criticos);
@@ -84,6 +89,8 @@ public class PlanificadorALNS {
             } else {
                 actualizarPesos(destroy, repair, -1);
             }
+            long msActual = System.currentTimeMillis() - start;
+            resultado.convergencia.add(new long[]{iter + 1, msActual, (long) bestFitness});
             iter++;
         }
 
