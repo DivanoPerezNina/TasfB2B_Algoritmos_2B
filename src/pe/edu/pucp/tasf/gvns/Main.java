@@ -651,11 +651,18 @@ public class Main {
         }
         datos.cargarVuelos(RUTA_VUELOS);
 
-        // ── 2. Inicio UTC desde la fecha configurada ──────────────────────────
-        int  anio      = FECHA_INICIO_AAAAMMDD / 10000;
-        int  mes       = (FECHA_INICIO_AAAAMMDD / 100) % 100;
-        int  dia       = FECHA_INICIO_AAAAMMDD % 100;
+        // ── 2. Inicio UTC desde el primer registro real del dataset ───────────
+        System.out.println("\nBuscando inicio del dataset (scan streaming)...");
+        String fechaInicio = GestorDatos.encontrarInicioDataset(RUTA_ENVIOS);
+        if (fechaInicio == null) {
+            System.err.println("No se encontraron archivos de envíos en: " + RUTA_ENVIOS);
+            return;
+        }
+        int  anio      = Integer.parseInt(fechaInicio.substring(0, 4));
+        int  mes       = Integer.parseInt(fechaInicio.substring(4, 6));
+        int  dia       = Integer.parseInt(fechaInicio.substring(6, 8));
         long inicioUTC = GestorDatos.calcularEpochMinutos(anio, mes, dia, 0, 0, 0);
+        System.out.printf("Inicio UTC: %d (día %s)%n", inicioUTC, fechaInicio);
 
         // ── 3. Definir lote de ejecuciones ────────────────────────────────────
         // FIFO×1 + EDF×1 + ALEATORIO×15 réplicas (semillas 1-15)
