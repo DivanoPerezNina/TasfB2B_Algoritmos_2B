@@ -662,7 +662,7 @@ public class Main {
         int  mes       = Integer.parseInt(fechaInicio.substring(4, 6));
         int  dia       = Integer.parseInt(fechaInicio.substring(6, 8));
         long inicioUTC = GestorDatos.calcularEpochMinutos(anio, mes, dia, 0, 0, 0);
-        long finUTC    = inicioUTC + 365L * 1440L; // tope de seguridad: 1 año
+        long finUTC    = Long.MAX_VALUE; // todo el dataset
         System.out.printf("Inicio UTC: %d (fecha %s)%n", inicioUTC, fechaInicio);
 
         // ── 3. Cargar TODO el dataset una sola vez ───────────────────────────
