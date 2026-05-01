@@ -121,6 +121,19 @@ public class PlanificadorALNS {
         return resultado;
     }
 
+    public boolean intentarPlanificarConAlternativas(int idx) {
+        RutaCandidata ruta = buscarRutaFactible(idx, false);
+        if (ruta == null) {
+            if (buscarRutaFactible(idx, true) == null) {
+                pool.setStatus(idx, ActiveShipmentPool.NO_FACTIBLE_ESTRUCTURAL);
+            }
+            return false;
+        }
+
+        reservarRuta(idx, ruta);
+        return true;
+    }
+
     private OperadorDestroy seleccionarDestroy() {
         double total = 0;
         for (double w : destroyWeights) total += w;
@@ -149,52 +162,182 @@ public class PlanificadorALNS {
         // Implementar lógica de destroy, ej random
         List<Integer> removidos = new ArrayList<>();
         int num = Math.min(10, criticos.size());
-        for (int i = 0; i < num; i++) {
-            removidos.add(criticos.get(rand.nextInt(criticos.size())));
+        List<Integer> candidatos = new ArrayList<>(criticos);
+        for (int i = 0; i < num && !candidatos.isEmpty(); i++) {
+            int pos = rand.nextInt(candidatos.size());
+            removidos.add(candidatos.remove(pos));
         }
         return removidos;
     }
 
     private void liberarReservas(int idx) {
-        // Implementar liberar
+        int length = routes.getRouteLength(idx);
+        if (length <= 0) {
+            return;
+        }
+
+        int quantity = pool.getQuantity(idx);
+        int currentAirport = pool.getOrigin(idx);
+        long previousArrivalUTC = pool.getReleaseUTC(idx);
+
+        for (int hop = 0; hop < length; hop++) {
+            int flightId = routes.getFlightId(idx, hop);
+            long departureUTC = routes.getDepartureUTC(idx, hop);
+
+            airports.releaseInterval(currentAirport, previousArrivalUTC, departureUTC, quantity);
+            flights.release(flightId, departureUTC, quantity);
+
+            previousArrivalUTC = calcularLlegadaUTC(departureUTC, flightId);
+            currentAirport = DatosEstaticos.flightDestination[flightId];
+        }
+
+        routes.clearRoute(idx);
     }
 
     private boolean planificarRutaInicial(int idx, OperadorRepair repair) {
-        // Implementar búsqueda de ruta
-        // Para brevedad, buscar directo
-        int orig = pool.getOrigin(idx);
-        int dest = pool.getDestination(idx);
-        int qty = pool.getQuantity(idx);
-        long release = pool.getReleaseUTC(idx);
-        // Buscar vuelo directo
-        boolean foundCandidate = false;
-        for (int f = 0; f < DatosEstaticos.numFlights; f++) {
-            if (DatosEstaticos.flightOrigin[f] == orig && DatosEstaticos.flightDestination[f] == dest) {
-                long dep = release / 1440 * 1440 + DatosEstaticos.flightDepartureUTCMinuteOfDay[f];
-                if (dep >= release) {
-                    foundCandidate = true;
-                    if (flights.canReserve(f, dep, qty) && airports.canReserveInterval(orig, release, dep, qty)) {
-                        flights.reserve(f, dep, qty);
-                        airports.reserveInterval(orig, release, dep, qty);
-                        int start = routes.allocateRoute(1);
-                        routes.setRoute(idx, start, 1, new int[]{f}, new long[]{dep});
-                        long arrivalUTC = dep + (DatosEstaticos.flightArrivalUTCMinuteOfDay[f] - DatosEstaticos.flightDepartureUTCMinuteOfDay[f]);
-                        if (arrivalUTC <= pool.getDeadlineUTC(idx)) {
-                            pool.setStatus(idx, ActiveShipmentPool.ENTREGADO);
-                        } else {
-                            pool.setStatus(idx, ActiveShipmentPool.RETRASADO);
-                        }
-                        return true;
-                    }
-                }
-            }
-        }
-        if (foundCandidate) {
-            pool.setStatus(idx, ActiveShipmentPool.NO_FACTIBLE_ESTRUCTURAL);
-        } else {
+        boolean planificado = intentarPlanificarConAlternativas(idx);
+        if (!planificado && pool.getStatus(idx) != ActiveShipmentPool.NO_FACTIBLE_ESTRUCTURAL) {
             pool.setStatus(idx, ActiveShipmentPool.SIN_RUTA);
         }
-        return false;
+        return planificado;
+    }
+
+    private RutaCandidata buscarRutaFactible(int idx, boolean ignorarCapacidades) {
+        int origen = pool.getOrigin(idx);
+        int destino = pool.getDestination(idx);
+        int quantity = pool.getQuantity(idx);
+        long releaseUTC = pool.getReleaseUTC(idx);
+        long deadlineUTC = pool.getDeadlineUTC(idx);
+
+        boolean[] visitados = new boolean[DatosEstaticos.airportCode.length];
+        visitados[origen] = true;
+
+        return buscarRutaRecursiva(origen, destino, quantity, releaseUTC, deadlineUTC,
+                ConfigExperimentacion.MAX_SALTOS, visitados,
+                new int[ConfigExperimentacion.MAX_SALTOS],
+                new long[ConfigExperimentacion.MAX_SALTOS],
+                0, ignorarCapacidades);
+    }
+
+    private RutaCandidata buscarRutaRecursiva(int aeropuertoActual, int destinoFinal, int quantity,
+                                              long tiempoMasTemprano, long deadlineUTC,
+                                              int saltosRestantes, boolean[] visitados,
+                                              int[] flightsPath, long[] departuresPath,
+                                              int profundidad, boolean ignorarCapacidades) {
+        if (saltosRestantes <= 0) {
+            return null;
+        }
+
+        for (int flightId = 0; flightId < DatosEstaticos.numFlights; flightId++) {
+            if (DatosEstaticos.flightOrigin[flightId] != aeropuertoActual) {
+                continue;
+            }
+
+            int aeropuertoSiguiente = DatosEstaticos.flightDestination[flightId];
+            if (visitados[aeropuertoSiguiente] && aeropuertoSiguiente != destinoFinal) {
+                continue;
+            }
+
+            long departureUTC = calcularProximaSalidaUTC(tiempoMasTemprano,
+                    DatosEstaticos.flightDepartureUTCMinuteOfDay[flightId]);
+            if (departureUTC > deadlineUTC) {
+                continue;
+            }
+
+            long arrivalUTC = calcularLlegadaUTC(departureUTC, flightId);
+            if (arrivalUTC > deadlineUTC) {
+                continue;
+            }
+
+            if (!ignorarCapacidades) {
+                if (!flights.canReserve(flightId, departureUTC, quantity)) {
+                    continue;
+                }
+                if (!airports.canReserveInterval(aeropuertoActual, tiempoMasTemprano, departureUTC, quantity)) {
+                    continue;
+                }
+            }
+
+            flightsPath[profundidad] = flightId;
+            departuresPath[profundidad] = departureUTC;
+
+            if (aeropuertoSiguiente == destinoFinal) {
+                return construirRutaCandidata(flightsPath, departuresPath, profundidad + 1, arrivalUTC);
+            }
+
+            visitados[aeropuertoSiguiente] = true;
+            RutaCandidata siguiente = buscarRutaRecursiva(aeropuertoSiguiente, destinoFinal, quantity,
+                    arrivalUTC, deadlineUTC, saltosRestantes - 1, visitados,
+                    flightsPath, departuresPath, profundidad + 1, ignorarCapacidades);
+            visitados[aeropuertoSiguiente] = false;
+
+            if (siguiente != null) {
+                return siguiente;
+            }
+        }
+
+        return null;
+    }
+
+    private RutaCandidata construirRutaCandidata(int[] flightsPath, long[] departuresPath, int length,
+                                                 long arrivalUTC) {
+        RutaCandidata ruta = new RutaCandidata(length, arrivalUTC);
+        for (int i = 0; i < length; i++) {
+            ruta.flightIds[i] = flightsPath[i];
+            ruta.departures[i] = departuresPath[i];
+        }
+        return ruta;
+    }
+
+    private long calcularProximaSalidaUTC(long earliestUTC, int departureMinuteOfDay) {
+        long dayStartUTC = (earliestUTC / 1440L) * 1440L;
+        long departureUTC = dayStartUTC + departureMinuteOfDay;
+        if (departureUTC < earliestUTC) {
+            departureUTC += 1440L;
+        }
+        return departureUTC;
+    }
+
+    private long calcularLlegadaUTC(long departureUTC, int flightId) {
+        return departureUTC + (DatosEstaticos.flightArrivalUTCMinuteOfDay[flightId]
+                - DatosEstaticos.flightDepartureUTCMinuteOfDay[flightId]);
+    }
+
+    private void reservarRuta(int idx, RutaCandidata ruta) {
+        int quantity = pool.getQuantity(idx);
+        int currentAirport = pool.getOrigin(idx);
+        long previousArrivalUTC = pool.getReleaseUTC(idx);
+
+        for (int hop = 0; hop < ruta.length; hop++) {
+            int flightId = ruta.flightIds[hop];
+            long departureUTC = ruta.departures[hop];
+
+            airports.reserveInterval(currentAirport, previousArrivalUTC, departureUTC, quantity);
+            flights.reserve(flightId, departureUTC, quantity);
+
+            previousArrivalUTC = calcularLlegadaUTC(departureUTC, flightId);
+            currentAirport = DatosEstaticos.flightDestination[flightId];
+        }
+
+        int start = routes.allocateRoute(ruta.length);
+        routes.setRoute(idx, start, ruta.length, ruta.flightIds, ruta.departures);
+        pool.setStatus(idx, ruta.arrivalUTC <= pool.getDeadlineUTC(idx)
+                ? ActiveShipmentPool.ENTREGADO
+                : ActiveShipmentPool.RETRASADO);
+    }
+
+    private static final class RutaCandidata {
+        final int[] flightIds;
+        final long[] departures;
+        final int length;
+        final long arrivalUTC;
+
+        RutaCandidata(int length, long arrivalUTC) {
+            this.flightIds = new int[length];
+            this.departures = new long[length];
+            this.length = length;
+            this.arrivalUTC = arrivalUTC;
+        }
     }
 
     private void actualizarPesos(OperadorDestroy d, OperadorRepair r, int score) {
