@@ -636,13 +636,13 @@ public class Main {
     public static void ejecutarPruebaTechoTecnicoGVNS() {
         System.out.println("======================================================");
         System.out.println(" TECHO TÉCNICO GVNS — Time-to-Failure");
-        System.out.printf ("   Fecha inicio : %d%n", FECHA_INICIO_AAAAMMDD);
-        System.out.println("   Capacidades  : REALES (sin estrangulamiento)");
-        System.out.println("   Bloque       : 1 día (1 440 min)");
-        System.out.println("   Parada       : primer bloque con rechazados > 0 tras GVNS");
+        System.out.println("   Capacidades : REALES (sin estrangulamiento)");
+        System.out.println("   Dataset     : completo desde el primer registro");
+        System.out.println("   Colapso     : primer envío con status RETRASADO");
+        System.out.println("   Runs        : FIFO×1, EDF×1, ALEATORIO×5 semillas");
         System.out.println("======================================================");
 
-        // ── 1. Cargar red (capacidades reales) ───────────────────────────────
+        // ── 1. Cargar red ────────────────────────────────────────────────────
         GestorDatos datos = new GestorDatos();
         datos.cargarAeropuertos(RUTA_AEROPUERTOS);
         if (datos.numAeropuertos == 0) {
@@ -651,8 +651,8 @@ public class Main {
         }
         datos.cargarVuelos(RUTA_VUELOS);
 
-        // ── 2. Inicio UTC desde el primer registro real del dataset ───────────
-        System.out.println("\nBuscando inicio del dataset (scan streaming)...");
+        // ── 2. Detectar inicio y fin del dataset ─────────────────────────────
+        System.out.println("\nBuscando inicio del dataset...");
         String fechaInicio = GestorDatos.encontrarInicioDataset(RUTA_ENVIOS);
         if (fechaInicio == null) {
             System.err.println("No se encontraron archivos de envíos en: " + RUTA_ENVIOS);
@@ -662,164 +662,103 @@ public class Main {
         int  mes       = Integer.parseInt(fechaInicio.substring(4, 6));
         int  dia       = Integer.parseInt(fechaInicio.substring(6, 8));
         long inicioUTC = GestorDatos.calcularEpochMinutos(anio, mes, dia, 0, 0, 0);
-        System.out.printf("Inicio UTC: %d (día %s)%n", inicioUTC, fechaInicio);
+        long finUTC    = inicioUTC + 365L * 1440L; // tope de seguridad: 1 año
+        System.out.printf("Inicio UTC: %d (fecha %s)%n", inicioUTC, fechaInicio);
 
-        // ── 3. Definir lote de ejecuciones ────────────────────────────────────
-        // FIFO×1 + EDF×1 + ALEATORIO×15 réplicas (semillas 1-15)
-        int totalRuns = 1 + 1 + 15;   // 17 runs en total
+        // ── 3. Cargar TODO el dataset una sola vez ───────────────────────────
+        System.out.println("\nCargando dataset completo...");
+        datos.cargarTodosLosEnvios(RUTA_ENVIOS, inicioUTC, finUTC);
+        int totalEnvios = datos.numEnvios;
+        System.out.printf("Total envíos cargados: %,d%n", totalEnvios);
+        if (totalEnvios == 0) {
+            System.err.println("Dataset vacío.");
+            return;
+        }
+
+        // ── 4. Definir runs ──────────────────────────────────────────────────
+        // Semillas fijas del proyecto
+        long[] semillasAleatorio = {42L, 12345L, 99999L, 7777L, 31415L};
+        int totalRuns = 1 + 1 + semillasAleatorio.length;   // 7 runs
+
         String[]        algNombres = new String[totalRuns];
         CriterioOrden[] algCrit    = new CriterioOrden[totalRuns];
         long[]          algSemilla = new long[totalRuns];
         int[]           algReplica = new int[totalRuns];
 
         int r = 0;
-        algNombres[r] = "GVNS-FIFO";  algCrit[r] = CriterioOrden.FIFO;
-        algSemilla[r] = 42L;           algReplica[r] = 1; r++;
+        algNombres[r] = "GVNS-FIFO";     algCrit[r] = CriterioOrden.FIFO;
+        algSemilla[r] = 42L;              algReplica[r] = 1; r++;
 
-        algNombres[r] = "GVNS-EDF";   algCrit[r] = CriterioOrden.EDF;
-        algSemilla[r] = 42L;           algReplica[r] = 1; r++;
+        algNombres[r] = "GVNS-EDF";      algCrit[r] = CriterioOrden.EDF;
+        algSemilla[r] = 42L;              algReplica[r] = 1; r++;
 
-        for (int s = 1; s <= 15; s++) {
+        for (int s = 0; s < semillasAleatorio.length; s++) {
             algNombres[r] = "GVNS-ALEATORIO"; algCrit[r] = CriterioOrden.ALEATORIO;
-            algSemilla[r] = (long) s;           algReplica[r] = s; r++;
+            algSemilla[r] = semillasAleatorio[s]; algReplica[r] = s + 1; r++;
         }
 
-        // ── 4. CSVs de salida ─────────────────────────────────────────────────
-        String carpeta    = "resultados_techo_tecnico";
+        // ── 5. Archivos de salida ────────────────────────────────────────────
+        String carpeta   = "resultados_techo_tecnico";
         new File(carpeta).mkdirs();
-        // Resumen: una fila por run
         String csvResumen = carpeta + "/resultados_techo_tecnico_gvns.csv";
-        // Detalle: una fila por día por run
-        String csvDetalle = carpeta + "/detalle_techo_tecnico_gvns.csv";
         try (PrintWriter pw = new PrintWriter(new FileWriter(csvResumen, false))) {
-            pw.println("Algoritmo,Replica,Dias_Soportados,Volumen_Maximo_Soportado,Colapso");
+            pw.println("Algoritmo,Replica,Total_Envios,Exitosos,Retrasados,Techo_Tecnico,Colapso");
         } catch (Exception ex) {
-            System.err.println("Error creando CSV resumen: " + ex.getMessage());
-            return;
-        }
-        try (PrintWriter pw = new PrintWriter(new FileWriter(csvDetalle, false))) {
-            pw.println("Algoritmo,Replica,Dia,Envios_Bloque,Rechazados_Greedy,"
-                     + "Rechazados_GVNS,Exitosos_Bloque,Acumulado_Exitosos,Colapso");
-        } catch (Exception ex) {
-            System.err.println("Error creando CSV detalle: " + ex.getMessage());
-            return;
+            System.err.println("Error creando CSV: " + ex.getMessage()); return;
         }
 
-        // ── 5. Bucle principal de runs ────────────────────────────────────────
+        // ── 6. Bucle de runs ─────────────────────────────────────────────────
         for (int ri = 0; ri < totalRuns; ri++) {
             String        nombre  = algNombres[ri];
             CriterioOrden crit    = algCrit[ri];
             long          semilla = algSemilla[ri];
             int           replica = algReplica[ri];
+            String        slug    = nombre.replace("-", "_");
 
             System.out.printf("%n══════ %s | Réplica %d (semilla=%d) ══════%n",
                     nombre, replica, semilla);
 
-            long volumenMaximo = 0;
-            int  bloqueActual  = 0;
-            int  diasSinEnvios = 0;
-            boolean colapsoHallado = false;
+            // Fase 2 — greedy
+            PlanificadorGVNSConcurrente plan =
+                    new PlanificadorGVNSConcurrente(datos, semilla, crit);
+            plan.construirSolucionInicial();
+            int rechazadosGreedy = plan.contarRechazadosActivos();
+            System.out.printf("  Rechazados greedy : %,d%n", rechazadosGreedy);
 
-            // Nombre seguro para archivo de convergencia del bloque de colapso
-            String algSlug = nombre.replace("-", "_").replace(" ", "_");
-
-            while (bloqueActual < 365) {
-                long blockStart = inicioUTC + (long) bloqueActual * 1440L;
-                long blockEnd   = blockStart + 1440L;
-
-                datos.resetEnvios();
-                datos.cargarTodosLosEnvios(RUTA_ENVIOS, blockStart, blockEnd);
-
-                if (datos.numEnvios == 0) {
-                    diasSinEnvios++;
-                    if (diasSinEnvios >= 3) {
-                        System.out.printf("  Día %d: 3 días sin datos → fin de dataset.%n",
-                                bloqueActual + 1);
-                        break;
-                    }
-                    bloqueActual++;
-                    continue;
-                }
-                diasSinEnvios = 0;
-
-                System.out.printf("  Día %2d | %,d envíos | ", bloqueActual + 1, datos.numEnvios);
-
-                // Fase 2
-                PlanificadorGVNSConcurrente plan =
-                        new PlanificadorGVNSConcurrente(datos, semilla, crit);
-                plan.construirSolucionInicial();
-                int rechazadosFase2 = plan.contarRechazadosActivos();
-
-                // Fase 3 — GVNS 120 s si hay rechazados
-                if (rechazadosFase2 > 0) {
-                    plan.ejecutarMejoraGVNS();
-                }
-
-                int rechazadosFinales = plan.contarRechazadosActivos();
-                int exitososBloque    = datos.numEnvios - rechazadosFinales;
-                volumenMaximo        += exitososBloque;
-                boolean esColapso     = rechazadosFinales > 0;
-
-                System.out.printf("rec_greedy=%d | rec_gvns=%d%n",
-                        rechazadosFase2, rechazadosFinales);
-
-                // Fila de detalle diario
-                try (PrintWriter pw = new PrintWriter(new FileWriter(csvDetalle, true))) {
-                    pw.printf("%s,%d,%d,%d,%d,%d,%d,%d,%s%n",
-                            nombre, replica, bloqueActual + 1,
-                            datos.numEnvios, rechazadosFase2, rechazadosFinales,
-                            exitososBloque, volumenMaximo,
-                            esColapso ? "SI" : "NO");
-                } catch (Exception ex) {
-                    System.err.println("Error escribiendo detalle: " + ex.getMessage());
-                }
-
-                if (esColapso) {
-                    System.out.printf("  *** COLAPSO en día %d: %d rechazados finales ***%n",
-                            bloqueActual + 1, rechazadosFinales);
-
-                    // Convergencia GVNS del bloque de colapso
-                    String csvConv = carpeta + "/convergencia_techo_"
-                            + algSlug + "_rep" + replica + ".csv";
-                    plan.exportarHistorialConvergenciaCSV(csvConv);
-
-                    // Resultados completos del bloque de colapso
-                    long fGreedy = plan.calcularTransitoTotal();
-                    String csvBloque = carpeta + "/bloque_colapso_"
-                            + algSlug + "_rep" + replica + ".csv";
-                    plan.exportarResultadosCSV(csvBloque, fGreedy, 0.0, 120.0,
-                            rechazadosFase2 - rechazadosFinales);
-
-                    colapsoHallado = true;
-                    break;
-                }
-
-                bloqueActual++;
+            // Fase 3 — GVNS 120 s si hay rechazados
+            if (rechazadosGreedy > 0) {
+                plan.ejecutarMejoraGVNS();
             }
 
-            if (!colapsoHallado) {
-                System.out.printf("  Sin colapso tras %d días. Volumen: %,d%n",
-                        bloqueActual, volumenMaximo);
-            } else {
-                System.out.printf("  Techo técnico: %,d envíos exitosos.%n", volumenMaximo);
-            }
+            // Colapso = al menos 1 envío rechazado tras GVNS
+            // (el planificador solo acepta rutas que cumplen el deadline, así que
+            //  "rechazado" ya engloba cualquier envío retrasado o sin ruta)
+            int rechazadosFinales = plan.contarRechazadosActivos();
+            int exitosos          = totalEnvios - rechazadosFinales;
+            boolean colapso       = rechazadosFinales > 0;
 
-            // Fila de resumen
+            System.out.printf("  Exitosos  : %,d%n", exitosos);
+            System.out.printf("  Rechazados: %,d  →  %s%n",
+                    rechazadosFinales, colapso ? "COLAPSO DETECTADO" : "sin colapso");
+
+            // Exportar convergencia GVNS
+            String csvConv = carpeta + "/convergencia_techo_" + slug + "_rep" + replica + ".csv";
+            plan.exportarHistorialConvergenciaCSV(csvConv);
+
+            // Fila resumen
             try (PrintWriter pw = new PrintWriter(new FileWriter(csvResumen, true))) {
-                pw.printf("%s,%d,%d,%d,%s%n",
-                        nombre, replica, bloqueActual,
-                        volumenMaximo, colapsoHallado ? "SI" : "NO");
+                pw.printf("%s,%d,%d,%d,%d,%d,%s%n",
+                        nombre, replica, totalEnvios, exitosos, rechazadosFinales,
+                        exitosos,
+                        colapso ? "SI" : "NO");
             } catch (Exception ex) {
-                System.err.println("Error escribiendo resumen: " + ex.getMessage());
+                System.err.println("Error escribiendo CSV: " + ex.getMessage());
             }
         }
 
         System.out.println("\n====== TECHO TÉCNICO COMPLETADO ======");
-        System.out.println("Archivos en: " + carpeta + "/");
-        System.out.println("  resultados_techo_tecnico_gvns.csv  ← resumen por run (para Wilcoxon)");
-        System.out.println("  detalle_techo_tecnico_gvns.csv     ← progresión día a día");
-        System.out.println("  convergencia_techo_*.csv           ← curva GVNS del bloque de colapso");
-        System.out.println("  bloque_colapso_*.csv               ← métricas completas del bloque que colapsó");
+        System.out.println("  " + csvResumen);
+        System.out.println("  " + carpeta + "/convergencia_techo_*.csv");
     }
 
     // =========================================================================
