@@ -675,8 +675,15 @@ public class Main {
             return;
         }
 
-        // ── 4. Definir runs ──────────────────────────────────────────────────
-        // Semillas fijas del proyecto
+        // Guardar maletas originales para poder restaurar entre runs
+        int[] maletasBase = java.util.Arrays.copyOf(datos.envioMaletas, totalEnvios);
+
+        // ── 4. Factores de escala de demanda ─────────────────────────────────
+        // Se multiplican las maletas de cada envío para estresar la red.
+        // Con 63% de ocupación base, el primer rechazo aparece ~1.6×.
+        double[] factores = {1.0, 1.25, 1.5, 1.6, 1.75, 2.0, 2.5, 3.0};
+
+        // ── 5. Algoritmos y semillas ─────────────────────────────────────────
         long[] semillasAleatorio = {42L, 12345L, 99999L, 7777L, 31415L};
         int totalRuns = 1 + 1 + semillasAleatorio.length;   // 7 runs
 
@@ -686,28 +693,27 @@ public class Main {
         int[]           algReplica = new int[totalRuns];
 
         int r = 0;
-        algNombres[r] = "GVNS-FIFO";     algCrit[r] = CriterioOrden.FIFO;
-        algSemilla[r] = 42L;              algReplica[r] = 1; r++;
-
-        algNombres[r] = "GVNS-EDF";      algCrit[r] = CriterioOrden.EDF;
-        algSemilla[r] = 42L;              algReplica[r] = 1; r++;
-
+        algNombres[r] = "GVNS-FIFO";    algCrit[r] = CriterioOrden.FIFO;
+        algSemilla[r] = 42L;             algReplica[r] = 1; r++;
+        algNombres[r] = "GVNS-EDF";     algCrit[r] = CriterioOrden.EDF;
+        algSemilla[r] = 42L;             algReplica[r] = 1; r++;
         for (int s = 0; s < semillasAleatorio.length; s++) {
             algNombres[r] = "GVNS-ALEATORIO"; algCrit[r] = CriterioOrden.ALEATORIO;
             algSemilla[r] = semillasAleatorio[s]; algReplica[r] = s + 1; r++;
         }
 
-        // ── 5. Archivos de salida ────────────────────────────────────────────
-        String carpeta   = "resultados_techo_tecnico";
+        // ── 6. Archivos de salida ────────────────────────────────────────────
+        String carpeta    = "resultados_techo_tecnico";
         new File(carpeta).mkdirs();
         String csvResumen = carpeta + "/resultados_techo_tecnico_gvns.csv";
         try (PrintWriter pw = new PrintWriter(new FileWriter(csvResumen, false))) {
-            pw.println("Algoritmo,Replica,Total_Envios,Exitosos,Retrasados,Techo_Tecnico,Colapso");
+            pw.println("Algoritmo,Replica,Factor_Escala,Total_Envios,"
+                     + "Exitosos,Rechazados,Ocupacion_Max_Pct,Techo_Tecnico,Colapso");
         } catch (Exception ex) {
             System.err.println("Error creando CSV: " + ex.getMessage()); return;
         }
 
-        // ── 6. Bucle de runs ─────────────────────────────────────────────────
+        // ── 7. Bucle: por algoritmo → por factor de escala ───────────────────
         for (int ri = 0; ri < totalRuns; ri++) {
             String        nombre  = algNombres[ri];
             CriterioOrden crit    = algCrit[ri];
@@ -718,61 +724,64 @@ public class Main {
             System.out.printf("%n══════ %s | Réplica %d (semilla=%d) ══════%n",
                     nombre, replica, semilla);
 
-            // Fase 2 — greedy
-            PlanificadorGVNSConcurrente plan =
-                    new PlanificadorGVNSConcurrente(datos, semilla, crit);
-            plan.construirSolucionInicial();
-            int rechazadosGreedy = plan.contarRechazadosActivos();
-            System.out.printf("  Rechazados greedy : %,d%n", rechazadosGreedy);
+            for (double factor : factores) {
+                // Escalar maletas
+                for (int i = 0; i < totalEnvios; i++)
+                    datos.envioMaletas[i] = Math.max(1, (int) Math.round(maletasBase[i] * factor));
 
-            // Fase 3 — GVNS 120 s si hay rechazados
-            if (rechazadosGreedy > 0) {
-                plan.ejecutarMejoraGVNS();
-            }
+                System.out.printf("  Factor %.2f× → ", factor);
 
-            // Colapso = al menos 1 envío rechazado tras GVNS
-            // (el planificador solo acepta rutas que cumplen el deadline, así que
-            //  "rechazado" ya engloba cualquier envío retrasado o sin ruta)
-            int rechazadosFinales = plan.contarRechazadosActivos();
-            int exitosos          = totalEnvios - rechazadosFinales;
-            boolean colapso       = rechazadosFinales > 0;
+                // Fase 2
+                PlanificadorGVNSConcurrente plan =
+                        new PlanificadorGVNSConcurrente(datos, semilla, crit);
+                plan.construirSolucionInicial();
+                int rechazadosGreedy = plan.contarRechazadosActivos();
 
-            System.out.printf("  Exitosos  : %,d%n", exitosos);
-            System.out.printf("  Rechazados: %,d  →  %s%n",
-                    rechazadosFinales, colapso ? "COLAPSO DETECTADO" : "sin colapso");
+                // Fase 3 si hay rechazados
+                if (rechazadosGreedy > 0) plan.ejecutarMejoraGVNS();
 
-            // ── Auditoría: tránsito total y ocupación máxima de vuelos ───────
-            long transitoTotal = plan.calcularTransitoTotal();
-            int maxOcup = 0; int maxCap = 1;
-            for (java.util.Map.Entry<Long, java.util.concurrent.atomic.AtomicInteger> entry
-                    : plan.ocupacionVuelos.entrySet()) {
-                int ocu = entry.getValue().get();
-                if (ocu > maxOcup) {
-                    maxOcup = ocu;
-                    int vId = (int)(entry.getKey() / 100_000L);
-                    maxCap  = datos.vueloCapacidad[vId];
+                int rechazadosFinales = plan.contarRechazadosActivos();
+                int exitosos          = totalEnvios - rechazadosFinales;
+                boolean colapso       = rechazadosFinales > 0;
+
+                // Ocupación máxima
+                int maxOcup = 0; int maxCap = 1;
+                for (java.util.Map.Entry<Long, java.util.concurrent.atomic.AtomicInteger> e
+                        : plan.ocupacionVuelos.entrySet()) {
+                    int ocu = e.getValue().get();
+                    if (ocu > maxOcup) {
+                        maxOcup = ocu;
+                        maxCap  = datos.vueloCapacidad[(int)(e.getKey() / 100_000L)];
+                    }
                 }
-            }
-            double pctOcupMax = maxCap > 0 ? maxOcup * 100.0 / maxCap : 0;
-            System.out.printf("  [AUDIT] Tránsito total : %,d min%n", transitoTotal);
-            System.out.printf("  [AUDIT] Ocupación máx. : %d / %d maletas (%.1f%%)%n",
-                    maxOcup, maxCap, pctOcupMax);
-            System.out.printf("  [AUDIT] Slots vuelo-día usados: %,d%n",
-                    plan.ocupacionVuelos.size());
+                double pctOcup = maxCap > 0 ? maxOcup * 100.0 / maxCap : 0;
 
-            // Exportar convergencia GVNS
-            String csvConv = carpeta + "/convergencia_techo_" + slug + "_rep" + replica + ".csv";
-            plan.exportarHistorialConvergenciaCSV(csvConv);
+                System.out.printf("exitosos=%,d | rechazados=%,d | ocup_max=%.1f%%  →  %s%n",
+                        exitosos, rechazadosFinales, pctOcup,
+                        colapso ? "COLAPSO" : "OK");
 
-            // Fila resumen
-            try (PrintWriter pw = new PrintWriter(new FileWriter(csvResumen, true))) {
-                pw.printf("%s,%d,%d,%d,%d,%d,%s%n",
-                        nombre, replica, totalEnvios, exitosos, rechazadosFinales,
-                        exitosos,
-                        colapso ? "SI" : "NO");
-            } catch (Exception ex) {
-                System.err.println("Error escribiendo CSV: " + ex.getMessage());
+                // Convergencia solo del primer factor con colapso
+                if (colapso) {
+                    String csvConv = carpeta + "/convergencia_techo_"
+                            + slug + "_rep" + replica + ".csv";
+                    plan.exportarHistorialConvergenciaCSV(csvConv);
+                }
+
+                // Fila CSV
+                try (PrintWriter pw = new PrintWriter(new FileWriter(csvResumen, true))) {
+                    pw.printf("%s,%d,%.2f,%d,%d,%d,%.1f,%d,%s%n",
+                            nombre, replica, factor, totalEnvios,
+                            exitosos, rechazadosFinales, pctOcup,
+                            exitosos, colapso ? "SI" : "NO");
+                } catch (Exception ex) {
+                    System.err.println("Error escribiendo CSV: " + ex.getMessage());
+                }
+
+                if (colapso) break; // no seguir escalando para este algoritmo
             }
+
+            // Restaurar maletas originales para el siguiente algoritmo
+            System.arraycopy(maletasBase, 0, datos.envioMaletas, 0, totalEnvios);
         }
 
         System.out.println("\n====== TECHO TÉCNICO COMPLETADO ======");
