@@ -741,6 +741,25 @@ public class Main {
             System.out.printf("  Rechazados: %,d  →  %s%n",
                     rechazadosFinales, colapso ? "COLAPSO DETECTADO" : "sin colapso");
 
+            // ── Auditoría: tránsito total y ocupación máxima de vuelos ───────
+            long transitoTotal = plan.calcularTransitoTotal();
+            int maxOcup = 0; int maxCap = 1;
+            for (java.util.Map.Entry<Long, java.util.concurrent.atomic.AtomicInteger> entry
+                    : plan.ocupacionVuelos.entrySet()) {
+                int ocu = entry.getValue().get();
+                if (ocu > maxOcup) {
+                    maxOcup = ocu;
+                    int vId = (int)(entry.getKey() / 100_000L);
+                    maxCap  = datos.vueloCapacidad[vId];
+                }
+            }
+            double pctOcupMax = maxCap > 0 ? maxOcup * 100.0 / maxCap : 0;
+            System.out.printf("  [AUDIT] Tránsito total : %,d min%n", transitoTotal);
+            System.out.printf("  [AUDIT] Ocupación máx. : %d / %d maletas (%.1f%%)%n",
+                    maxOcup, maxCap, pctOcupMax);
+            System.out.printf("  [AUDIT] Slots vuelo-día usados: %,d%n",
+                    plan.ocupacionVuelos.size());
+
             // Exportar convergencia GVNS
             String csvConv = carpeta + "/convergencia_techo_" + slug + "_rep" + replica + ".csv";
             plan.exportarHistorialConvergenciaCSV(csvConv);
