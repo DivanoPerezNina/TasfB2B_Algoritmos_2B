@@ -684,12 +684,24 @@ public class Main {
             algSemilla[r] = (long) s;           algReplica[r] = s; r++;
         }
 
-        // ── 4. CSV de salida ──────────────────────────────────────────────────
-        String csvSalida = "resultados_techo_tecnico_gvns.csv";
-        try (PrintWriter pw = new PrintWriter(new FileWriter(csvSalida, false))) {
-            pw.println("Algoritmo,Replica,Volumen_Maximo_Soportado");
+        // ── 4. CSVs de salida ─────────────────────────────────────────────────
+        String carpeta    = "resultados_techo_tecnico";
+        new File(carpeta).mkdirs();
+        // Resumen: una fila por run
+        String csvResumen = carpeta + "/resultados_techo_tecnico_gvns.csv";
+        // Detalle: una fila por día por run
+        String csvDetalle = carpeta + "/detalle_techo_tecnico_gvns.csv";
+        try (PrintWriter pw = new PrintWriter(new FileWriter(csvResumen, false))) {
+            pw.println("Algoritmo,Replica,Dias_Soportados,Volumen_Maximo_Soportado,Colapso");
         } catch (Exception ex) {
-            System.err.println("Error creando CSV: " + ex.getMessage());
+            System.err.println("Error creando CSV resumen: " + ex.getMessage());
+            return;
+        }
+        try (PrintWriter pw = new PrintWriter(new FileWriter(csvDetalle, false))) {
+            pw.println("Algoritmo,Replica,Dia,Envios_Bloque,Rechazados_Greedy,"
+                     + "Rechazados_GVNS,Exitosos_Bloque,Acumulado_Exitosos,Colapso");
+        } catch (Exception ex) {
+            System.err.println("Error creando CSV detalle: " + ex.getMessage());
             return;
         }
 
@@ -703,17 +715,18 @@ public class Main {
             System.out.printf("%n══════ %s | Réplica %d (semilla=%d) ══════%n",
                     nombre, replica, semilla);
 
-            long volumenMaximo    = 0;
-            int  bloqueActual     = 0;
-            int  diasSinEnvios    = 0;
+            long volumenMaximo = 0;
+            int  bloqueActual  = 0;
+            int  diasSinEnvios = 0;
             boolean colapsoHallado = false;
 
-            // Bloques diarios hasta colapso o fin de datos (límite 365 días)
+            // Nombre seguro para archivo de convergencia del bloque de colapso
+            String algSlug = nombre.replace("-", "_").replace(" ", "_");
+
             while (bloqueActual < 365) {
                 long blockStart = inicioUTC + (long) bloqueActual * 1440L;
                 long blockEnd   = blockStart + 1440L;
 
-                // Cargar envíos del bloque
                 datos.resetEnvios();
                 datos.cargarTodosLosEnvios(RUTA_ENVIOS, blockStart, blockEnd);
 
@@ -731,31 +744,52 @@ public class Main {
 
                 System.out.printf("  Día %2d | %,d envíos | ", bloqueActual + 1, datos.numEnvios);
 
-                // Fase 2 — Solución inicial greedy
+                // Fase 2
                 PlanificadorGVNSConcurrente plan =
                         new PlanificadorGVNSConcurrente(datos, semilla, crit);
                 plan.construirSolucionInicial();
-
                 int rechazadosFase2 = plan.contarRechazadosActivos();
 
-                // Fase 3 — GVNS 120 s (solo si hay rechazados tras Fase 2)
+                // Fase 3 — GVNS 120 s si hay rechazados
                 if (rechazadosFase2 > 0) {
                     plan.ejecutarMejoraGVNS();
                 }
 
                 int rechazadosFinales = plan.contarRechazadosActivos();
                 int exitososBloque    = datos.numEnvios - rechazadosFinales;
+                volumenMaximo        += exitososBloque;
+                boolean esColapso     = rechazadosFinales > 0;
 
                 System.out.printf("rec_greedy=%d | rec_gvns=%d%n",
                         rechazadosFase2, rechazadosFinales);
 
-                // Acumular exitosos de este bloque (parcial o total)
-                volumenMaximo += exitososBloque;
+                // Fila de detalle diario
+                try (PrintWriter pw = new PrintWriter(new FileWriter(csvDetalle, true))) {
+                    pw.printf("%s,%d,%d,%d,%d,%d,%d,%d,%s%n",
+                            nombre, replica, bloqueActual + 1,
+                            datos.numEnvios, rechazadosFase2, rechazadosFinales,
+                            exitososBloque, volumenMaximo,
+                            esColapso ? "SI" : "NO");
+                } catch (Exception ex) {
+                    System.err.println("Error escribiendo detalle: " + ex.getMessage());
+                }
 
-                if (rechazadosFinales > 0) {
-                    // Colapso detectado
+                if (esColapso) {
                     System.out.printf("  *** COLAPSO en día %d: %d rechazados finales ***%n",
                             bloqueActual + 1, rechazadosFinales);
+
+                    // Convergencia GVNS del bloque de colapso
+                    String csvConv = carpeta + "/convergencia_techo_"
+                            + algSlug + "_rep" + replica + ".csv";
+                    plan.exportarHistorialConvergenciaCSV(csvConv);
+
+                    // Resultados completos del bloque de colapso
+                    long fGreedy = plan.calcularTransitoTotal();
+                    String csvBloque = carpeta + "/bloque_colapso_"
+                            + algSlug + "_rep" + replica + ".csv";
+                    plan.exportarResultadosCSV(csvBloque, fGreedy, 0.0, 120.0,
+                            rechazadosFase2 - rechazadosFinales);
+
                     colapsoHallado = true;
                     break;
                 }
@@ -770,16 +804,22 @@ public class Main {
                 System.out.printf("  Techo técnico: %,d envíos exitosos.%n", volumenMaximo);
             }
 
-            // Escribir fila al CSV
-            try (PrintWriter pw = new PrintWriter(new FileWriter(csvSalida, true))) {
-                pw.printf("%s,%d,%d%n", nombre, replica, volumenMaximo);
+            // Fila de resumen
+            try (PrintWriter pw = new PrintWriter(new FileWriter(csvResumen, true))) {
+                pw.printf("%s,%d,%d,%d,%s%n",
+                        nombre, replica, bloqueActual,
+                        volumenMaximo, colapsoHallado ? "SI" : "NO");
             } catch (Exception ex) {
-                System.err.println("Error escribiendo CSV: " + ex.getMessage());
+                System.err.println("Error escribiendo resumen: " + ex.getMessage());
             }
         }
 
         System.out.println("\n====== TECHO TÉCNICO COMPLETADO ======");
-        System.out.println("  " + csvSalida);
+        System.out.println("Archivos en: " + carpeta + "/");
+        System.out.println("  resultados_techo_tecnico_gvns.csv  ← resumen por run (para Wilcoxon)");
+        System.out.println("  detalle_techo_tecnico_gvns.csv     ← progresión día a día");
+        System.out.println("  convergencia_techo_*.csv           ← curva GVNS del bloque de colapso");
+        System.out.println("  bloque_colapso_*.csv               ← métricas completas del bloque que colapsó");
     }
 
     // =========================================================================
