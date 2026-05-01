@@ -681,7 +681,7 @@ public class Main {
         // ── 4. Factores de escala de demanda ─────────────────────────────────
         // Se multiplican las maletas de cada envío para estresar la red.
         // Con 63% de ocupación base, el primer rechazo aparece ~1.6×.
-        double[] factores = {1.0, 1.25, 1.5, 1.6, 1.75, 2.0, 2.5, 3.0};
+        double[] factores = {1.0, 1.25, 1.5, 1.6, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0};
 
         // ── 5. Algoritmos y semillas ─────────────────────────────────────────
         long[] semillasAleatorio = {42L, 12345L, 99999L, 7777L, 31415L};
