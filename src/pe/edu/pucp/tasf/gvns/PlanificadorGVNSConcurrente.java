@@ -114,7 +114,8 @@ public class PlanificadorGVNSConcurrente {
 
     /**
      * Historial de convergencia de la Fase 3.
-     * Cada entrada: long[] { iteracion, ms_transcurridos, mejor_fitness_hasta_ahora }.
+     * Cada entrada: long[] { iteracion, ms_transcurridos, mejor_rechazados, mejor_transito }.
+     * Ambos valores son estrictamente no-crecientes (best-so-far lexicográfico).
      * Poblado por ejecutarMejoraGVNS(); vacío si la Fase 3 no se ejecutó.
      */
     public final List<long[]> historialFitness = new ArrayList<>();
@@ -798,15 +799,16 @@ public class PlanificadorGVNSConcurrente {
         long tiempoInicio = System.currentTimeMillis();
         long tiempoLimite = tiempoInicio + TIEMPO_LIMITE_MS;
 
-        int  k              = 1;
-        long mejorFitness   = calcularFitnessTotal();
-        int  iterMejoras    = 0;
-        int  iterTotal      = 0;
+        int  k            = 1;
+        int  mejorRec     = contarRechazadosActivos();
+        long mejorTransito= calcularTransitoTotal();
+        int  iterMejoras  = 0;
+        int  iterTotal    = 0;
         // Escala el batch al tamaño del problema: ~0.001% de envíos por iteración
-        int  batchBase      = Math.max(BATCH_FACTOR, tablero.numEnvios / 100_000);
+        int  batchBase    = Math.max(BATCH_FACTOR, tablero.numEnvios / 100_000);
 
-        System.out.printf("  f(x) inicial = %,d | rechazados=%d | t_max=%ds | batch=%d%n",
-                mejorFitness, contarRechazadosActivos(), TIEMPO_LIMITE_MS / 1000, batchBase);
+        System.out.printf("  Inicial: rechazados=%d | transito=%,d | t_max=%ds | batch=%d%n",
+                mejorRec, mejorTransito, TIEMPO_LIMITE_MS / 1000, batchBase);
 
         while (System.currentTimeMillis() < tiempoLimite) {
             iterTotal++;
@@ -827,34 +829,45 @@ public class PlanificadorGVNSConcurrente {
             // Si quedaron rechazados, aplicar N2 (Exchange) también
             if (contarRechazadosActivos() > 0) aplicarVND_N2_Exchange();
 
-            // ── CRITERIO DE ACEPTACIÓN ────────────────────────────────────────
-            long nuevoFitness = calcularFitnessTotal();
-            if (nuevoFitness < mejorFitness) {
-                long mejora = mejorFitness - nuevoFitness;
-                mejorFitness = nuevoFitness;
+            // ── CRITERIO DE ACEPTACIÓN LEXICOGRÁFICO ─────────────────────────
+            // 1º minimizar rechazados; 2º (solo si igual) minimizar tránsito.
+            // Nunca se acepta una solución con más rechazados, sin importar el
+            // ahorro de tránsito (corrección del bug: transit_per_envío puede
+            // superar 2880 min cuando incluye espera en origen).
+            int  nuevoRec      = contarRechazadosActivos();
+            long nuevoTransito = calcularTransitoTotal();
+            boolean mejora = (nuevoRec < mejorRec)
+                          || (nuevoRec == mejorRec && nuevoTransito < mejorTransito);
+
+            if (mejora) {
+                long deltaRec = mejorRec - nuevoRec;
+                long deltaTr  = mejorTransito - nuevoTransito;
+                mejorRec      = nuevoRec;
+                mejorTransito = nuevoTransito;
                 iterMejoras++;
                 k = 1;
-                System.out.printf("  [Iter %4d] MEJORA -%,d → f(x)=%,d | rec=%d | k=1%n",
-                        iterTotal, mejora, mejorFitness, contarRechazadosActivos());
+                System.out.printf("  [Iter %4d] MEJORA rec-%d tr-%,d → rec=%d | k=1%n",
+                        iterTotal, deltaRec, deltaTr, mejorRec);
             } else {
                 revertirShaking(idsExp, rutasExp, diasExp, numExp);
                 k = (k % K_MAX) + 1;
                 if (iterTotal % 50 == 0)
-                    System.out.printf("  [Iter %4d] sin mejora | f(x)=%,d | rec=%d | k=%d%n",
-                            iterTotal, nuevoFitness, contarRechazadosActivos(), k);
+                    System.out.printf("  [Iter %4d] sin mejora | rec=%d tr=%,d | k=%d%n",
+                            iterTotal, nuevoRec, nuevoTransito, k);
             }
 
-            // Registrar mejor fitness conocido al cierre de cada iteración
+            // Registrar best-so-far al cierre de cada iteración (ambos componentes)
             historialFitness.add(new long[]{
                 iterTotal,
                 System.currentTimeMillis() - tiempoInicio,
-                mejorFitness
+                mejorRec,
+                mejorTransito
             });
         }
 
         long tTotal = System.currentTimeMillis() - tiempoInicio;
-        System.out.printf("GVNS Terminado | Iter=%d | MejorasAceptadas=%d | f_final=%,d min | t=%.2fs%n",
-                iterTotal, iterMejoras, mejorFitness, tTotal / 1000.0);
+        System.out.printf("GVNS Terminado | Iter=%d | MejorasAceptadas=%d | rec_final=%d | tr_final=%,d | t=%.2fs%n",
+                iterTotal, iterMejoras, mejorRec, mejorTransito, tTotal / 1000.0);
         return iterMejoras;
     }
 
@@ -1580,9 +1593,9 @@ public class PlanificadorGVNSConcurrente {
      */
     public void exportarHistorialConvergenciaCSV(String nombreArchivo) {
         try (PrintWriter pw = new PrintWriter(new FileWriter(nombreArchivo))) {
-            pw.println("iteracion,ms_transcurridos,mejor_fitness");
+            pw.println("iteracion,ms_transcurridos,rechazados,transito");
             for (long[] entrada : historialFitness) {
-                pw.printf("%d,%d,%d%n", entrada[0], entrada[1], entrada[2]);
+                pw.printf("%d,%d,%d,%d%n", entrada[0], entrada[1], entrada[2], entrada[3]);
             }
             System.out.println("Historial de convergencia exportado: " + nombreArchivo);
         } catch (Exception ex) {
