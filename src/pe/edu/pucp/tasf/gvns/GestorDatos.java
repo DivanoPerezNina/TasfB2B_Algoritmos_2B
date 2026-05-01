@@ -357,6 +357,55 @@ public class GestorDatos {
      * @return arreglo {@code [fechaYYYYMMDD, conteo]} con el día de mayor
      *         volumen; {@code null} si no se encontraron datos.
      */
+    /**
+     * Escanea el directorio de envíos y devuelve la fecha más antigua del
+     * dataset (formato {@code "YYYYMMDD"}), sin cargar datos en RAM.
+     *
+     * @param rutaDirectorio carpeta con archivos {@code _envios_IATA_.txt}
+     * @return fecha mínima como {@code "YYYYMMDD"}, o {@code null} si no hay datos.
+     */
+    public static String encontrarInicioDataset(String rutaDirectorio) {
+        String minFecha = null;
+
+        File carpeta = new File(rutaDirectorio);
+        if (!carpeta.isDirectory()) return null;
+
+        File[] archivos = carpeta.listFiles();
+        if (archivos == null) return null;
+
+        for (File archivo : archivos) {
+            if (!archivo.getName().startsWith("_envios_")
+                    || !archivo.getName().endsWith(".txt")) continue;
+
+            try (BufferedReader br = new BufferedReader(
+                    new InputStreamReader(new FileInputStream(archivo),
+                            StandardCharsets.UTF_8), 65_536)) {
+
+                String linea;
+                while ((linea = br.readLine()) != null) {
+                    linea = linea.trim();
+                    if (linea.isEmpty() || !linea.contains("-")) continue;
+
+                    int pri = linea.indexOf('-');
+                    if (pri < 0 || pri + 9 > linea.length()) continue;
+                    String fecha = linea.substring(pri + 1, pri + 9);
+                    if (fecha.length() == 8 && Character.isDigit(fecha.charAt(0))) {
+                        if (minFecha == null || fecha.compareTo(minFecha) < 0) {
+                            minFecha = fecha;
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                System.err.println("Error escaneando " + archivo.getName()
+                        + ": " + e.getMessage());
+            }
+        }
+
+        if (minFecha != null)
+            System.out.printf("Inicio del dataset: %s%n", minFecha);
+        return minFecha;
+    }
+
     public static String[] encontrarDiaPico(String rutaDirectorio) {
         Map<String, Long> conteoPorDia = new HashMap<>();
 
