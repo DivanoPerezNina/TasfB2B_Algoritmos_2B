@@ -13,10 +13,15 @@ public class ConfigExperimentacion {
     // Debug
     // MAX_ENVIOS_DEBUG = 100000 sirve para pruebas rápidas.
     // Para corrida completa se cambia manualmente a 0.
-    public static final int MAX_ENVIOS_DEBUG = 1000000; // 0 = sin límite, >0 detiene lectura en ese número
+    public static final int MAX_ENVIOS_DEBUG = 0; // 0 = sin límite, >0 detiene lectura en ese número
 
     // Exportación
     public static final boolean EXPORTAR_CSV = true;
+
+    // Criterios de orden para el ALNS (similar a GVNS)
+    // Deja vacío {} para desactivar pruebas con múltiples criterios
+    // Ej: {CriterioOrden.FIFO, CriterioOrden.EDF, CriterioOrden.ALEATORIO}
+    public static final CriterioOrden[] CRITERIOS_ALNS = {CriterioOrden.FIFO, CriterioOrden.EDF, CriterioOrden.ALEATORIO};
 
     // Escenarios activos
     public static final boolean EJECUTAR_3D = false;

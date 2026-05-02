@@ -12,11 +12,11 @@ import java.util.Map;
 public class MainALNS {
 
     /**
-     * {@code true} → ejecuta el experimento numérico base (3 días, capacidades reales,
-     * 120 s de ALNS) exportando a {@code resultados_3D/}.
+     * {@code true} → ejecuta el experimento numérico base diario (1 día, capacidades reales,
+     * 120 s de ALNS) exportando a {@code resultados_diario_alns/}.
      * Tiene prioridad sobre {@link #MODO_COLAPSO_ALNS}.
      */
-    private static final boolean MODO_EXPNUM_ALNS = false;
+    private static final boolean MODO_EXPNUM_ALNS = true;
 
     /** {@code true} → ejecuta la prueba de estrés (colapso) en lugar del modo normal. */
     private static final boolean MODO_COLAPSO_ALNS = false;
@@ -25,7 +25,7 @@ public class MainALNS {
     private static final int CAP_ESTRANGULAMIENTO = 2;
 
     /** Tiempo límite del ALNS en el modo colapso (ms). */
-    private static final long TIEMPO_LIMITE_COLAPSO_MS = 30_000L;
+    private static final long TIEMPO_LIMITE_COLAPSO_MS = 120_000L;
 
     /** Semillas fijas para las réplicas independientes. */
     private static final long[] SEMILLAS = {42L, 12345L, 99999L, 7777L, 31415L};
@@ -33,11 +33,30 @@ public class MainALNS {
     /** Número de réplicas independientes por escenario. */
     private static final int NUM_REPLICAS = SEMILLAS.length;
 
+    /** Modo rápido para generar estadísticas preliminares en menos tiempo. */
+    private static final boolean MODO_RAPIDO_ESTADISTICA = true;
+
+    /** Límite de réplicas en modo rápido. */
+    private static final int MAX_REPLICAS_MODO_RAPIDO = 2;
+
+    /** Límite de días procesados por réplica en modo rápido. */
+    private static final int MAX_DIAS_MODO_RAPIDO = 14;
+
+    /** Límite de envíos leídos por réplica en modo rápido. */
+    private static final int MAX_ENVIOS_MODO_RAPIDO = 200_000;
+
     public static void main(String[] args) throws IOException {
         try {
-            ejecutarExperimentoHastaColapsoALNS();
+            if (MODO_EXPNUM_ALNS) {
+                ejecutarModoNormalALNS();
+            } else if (MODO_COLAPSO_ALNS) {
+                ejecutarModoColapsoALNS();
+            } else {
+                // Comportamiento por compatibilidad: ejecutar la versión "hasta colapso"
+                ejecutarExperimentoHastaColapsoALNS();
+            }
         } catch (Exception e) {
-            System.err.println("Error en ALNS hasta colapso: " + e.getMessage());
+            System.err.println("Error ejecutando ALNS: " + e.getMessage());
             e.printStackTrace();
         }
     }
@@ -311,118 +330,224 @@ public class MainALNS {
     }
 
     // =========================================================================
-    // MODO EXPNUM ALNS — Experimento Numérico Base (3 días, 15 réplicas)
+    // MODO EXPNUM ALNS — Experimento Numérico Base Diario (1 día, 15 réplicas)
     // =========================================================================
 
     /**
-     * Ejecuta el experimento numérico base del ALNS: 15 réplicas con semillas
-     * 1-15, capacidades reales, ventana de 3 días desde
-     * {@code FECHA_INICIO_AAAAMMDD}, 120 s por réplica (mismo límite GVNS Fase 3).
+    * Ejecuta el experimento numérico base del ALNS: 15 réplicas con semillas
+    * 1-15, capacidades reales, avanzando día a día sobre todos los envíos desde
+    * {@code FECHA_INICIO_AAAAMMDD}, 120 s por réplica (mismo límite GVNS Fase 3).
      *
-     * <p>Exporta a {@code resultados_3D/}:
-     * <ul>
-     *   <li>{@code resultados_3dias_ALNS.csv} — una fila por réplica (columnar).</li>
-     *   <li>{@code convergencia_3dias_ALNS.csv} — curva de mejora de las 15 réplicas.</li>
-     * </ul>
+    * <p>Exporta a {@code resultados_diario_alns/}:
+    * <ul>
+    *   <li>{@code resultados_alns_diario_{criterio}.csv} — una fila por día y réplica.</li>
+    *   <li>{@code convergencia_alns_diario_{criterio}.csv} — curva de mejora de las 15 réplicas.</li>
+    * </ul>
      *
      * <p>Para activar: {@code MODO_EXPNUM_ALNS = true}.
      */
     public static void ejecutarModoNormalALNS() throws Exception {
-        final long TIEMPO_LIMITE_NORMAL_MS = 120_000L;
+        final long TIEMPO_LIMITE_NORMAL_MS = 30_000L;
         final int  MAX_ITER_NORMAL         = Integer.MAX_VALUE;
 
+        // Determinar criterios a probar (si están configurados)
+        CriterioOrden[] criterios = ConfigExperimentacion.CRITERIOS_ALNS;
+        if (criterios == null || criterios.length == 0) {
+            criterios = new CriterioOrden[]{CriterioOrden.FIFO}; // Default
+        }
+
+        final int replicasAEjecutar = MODO_RAPIDO_ESTADISTICA
+            ? Math.min(NUM_REPLICAS, MAX_REPLICAS_MODO_RAPIDO)
+            : NUM_REPLICAS;
+        final int maxDiasPorReplica = MODO_RAPIDO_ESTADISTICA ? MAX_DIAS_MODO_RAPIDO : Integer.MAX_VALUE;
+        final int maxEnviosPorReplica = MODO_RAPIDO_ESTADISTICA ? MAX_ENVIOS_MODO_RAPIDO : Integer.MAX_VALUE;
+
         System.out.println("======================================================");
-        System.out.println(" EXPNUM ALNS — Experimento Numérico Base (3 días, 15 réplicas)");
+        System.out.println(" EXPNUM ALNS — Experimento Numérico Base Diario (todos los pedidos, 15 réplicas)");
         System.out.printf ("   Fecha inicio : %d%n", ConfigExperimentacion.FECHA_INICIO_AAAAMMDD);
-        System.out.printf ("   Tiempo ALNS  : %.0f s | Réplicas: %d%n",
-                TIEMPO_LIMITE_NORMAL_MS / 1000.0, NUM_REPLICAS);
+        System.out.printf ("   Tiempo ALNS  : %.0f s | Réplicas: %d | Criterios: %d%n",
+            TIEMPO_LIMITE_NORMAL_MS / 1000.0, replicasAEjecutar, criterios.length);
+        if (MODO_RAPIDO_ESTADISTICA) {
+            System.out.printf ("   Modo rápido  : SI | maxDías=%d | maxEnvíos=%,d por réplica%n",
+                maxDiasPorReplica, maxEnviosPorReplica);
+        }
+        for (CriterioOrden c : criterios) {
+            System.out.printf ("     - %s%n", c.descripcion);
+        }
         System.out.println("======================================================");
 
         // 1. Cargar red con capacidades reales
         DatosEstaticos.cargarDatos();
 
-        // 2. Ventana de 3 días
+        // 2. Inicio desde la fecha configurada
         int fecha   = ConfigExperimentacion.FECHA_INICIO_AAAAMMDD;
         int anio    = fecha / 10000;
         int mes     = (fecha / 100) % 100;
         int dia     = fecha % 100;
         long inicioUTC = DatosEstaticos.calcularEpochMinutos(anio, mes, dia, 0, 0, 0);
-        long finUTC    = inicioUTC + 3L * 1440L;
+        System.out.printf("%nIniciando procesamiento diario por streaming desde UTC %d...%n", inicioUTC);
 
-        System.out.printf("%nCargando envíos [UTC %d → %d]...%n", inicioUTC, finUTC);
-
-        // 3. Materializar envíos una sola vez (streaming → lista)
-        List<ShipmentRecord> envios = cargarEnviosEnLista(inicioUTC, finUTC, 0);
-        System.out.printf("Envíos cargados: %,d%n", envios.size());
-
-        if (envios.isEmpty()) {
-            System.err.println("No se encontraron envíos en la ventana configurada.");
+        // Verificar que exista al menos un envío desde la fecha de inicio.
+        boolean hayEnviosDesdeInicio = false;
+        try (ShipmentStreamManager probe = new ShipmentStreamManager()) {
+            while (probe.hasNextBefore(inicioUTC)) {
+                probe.pollNext();
+            }
+            hayEnviosDesdeInicio = probe.hasNext();
+        }
+        if (!hayEnviosDesdeInicio) {
+            System.err.println("No se encontraron envíos desde la fecha de inicio configurada.");
             return;
         }
 
         // 4. Preparar archivos de salida
-        new File("resultados_3D").mkdirs();
-        String archivoDatos = "resultados_3D/resultados_3dias_ALNS.csv";
-        String archivoConv  = "resultados_3D/convergencia_3dias_ALNS.csv";
+        new File("resultados_diario_alns").mkdirs();
+        
+        // Iterar sobre criterios
+        for (CriterioOrden criterio : criterios) {
+            System.out.printf("%n============================================%n");
+            System.out.printf(" Ejecutando con criterio: %s%n", criterio.descripcion);
+            System.out.printf("============================================%n");
 
-        try (PrintWriter pw = new PrintWriter(new FileWriter(archivoDatos))) {
-            pw.println("Replica,Total Envios,Exitosos Total,Salvados ALNS,Rechazados Finales,"
-                     + "Transito Final (min),Tiempo ALNS (s),Iteraciones ALNS,Mejor FO,Tasa Exito Final (%)");
-        }
-        try (PrintWriter pw = new PrintWriter(new FileWriter(archivoConv))) {
-            pw.println("Replica,iteracion,ms_transcurridos,mejor_fitness");
-        }
+            String sufijo = criterio.name().toLowerCase();
+            String archivoDatos = "resultados_diario_alns/resultados_alns_diario_" + sufijo + ".csv";
+            String archivoConv  = "resultados_diario_alns/convergencia_alns_diario_" + sufijo + ".csv";
 
-        // 5. Bucle de réplicas con semillas 1-15
-        for (int rep = 1; rep <= NUM_REPLICAS; rep++) {
-            long semilla = SEMILLAS[rep - 1];
-            System.out.printf("%n--- Réplica %d/%d (semilla=%d) ---%n", rep, NUM_REPLICAS, semilla);
-
-            ActiveShipmentPool pool = new ActiveShipmentPool(envios.size() + 1000);
-            RouteStore routes = new RouteStore(envios.size() + 1000);
-            FlightCapacityStore flights = new FlightCapacityStore();
-            AirportCapacityTimeline airports =
-                    new AirportCapacityTimeline(DatosEstaticos.airportCode.length);
-
-            poblarPool(envios, pool, routes);
-
-            List<Integer> criticos = new ArrayList<>();
-            for (int i = 0; i < pool.getSize(); i++) criticos.add(i);
-
-            long t0 = System.currentTimeMillis();
-            PlanificadorALNS alns = new PlanificadorALNS(pool, routes, flights, airports, semilla);
-            ResultadoALNS resultado = alns.ejecutarALNS(criticos, TIEMPO_LIMITE_NORMAL_MS, MAX_ITER_NORMAL);
-            long tiempoMs = System.currentTimeMillis() - t0;
-
-            long[] metricas = calcularMetricasPool(pool, routes);
-            long exitosos    = metricas[0];
-            long rechazados  = metricas[1];
-            long transitoMin = metricas[2];
-            double tasa = envios.size() > 0 ? exitosos * 100.0 / envios.size() : 0;
-
-            System.out.printf("  Exitosos: %,d | Rechazados: %,d | Iter: %d | %.1f s%n",
-                    exitosos, rechazados, resultado.iteraciones, tiempoMs / 1000.0);
-
-            // Fila de datos (append)
-            try (PrintWriter pw = new PrintWriter(new FileWriter(archivoDatos, true))) {
-                pw.printf("%d,%d,%d,%d,%d,%d,%.3f,%d,%d,%.4f%n",
-                        rep, envios.size(), exitosos, resultado.reparados, rechazados,
-                        transitoMin, tiempoMs / 1000.0, resultado.iteraciones,
-                        (long) resultado.fitnessDespuesALNS, tasa);
+            try (PrintWriter pw = new PrintWriter(new FileWriter(archivoDatos))) {
+                pw.println("Replica,Dia,InicioUTCMin,FinUTCMin,EnviosLeidosDia,EntregadosAcum,PendientesAcum,"
+                         + "SinRutaAcum,RetrasadosAcum,NoFactiblesAcum,ReplanificacionesAcum,IteracionesALNS,Criterio");
             }
-            // Filas de convergencia (append)
-            try (PrintWriter pw = new PrintWriter(new FileWriter(archivoConv, true))) {
-                if (resultado.convergencia != null) {
-                    for (long[] row : resultado.convergencia) {
-                        pw.printf("%d,%d,%d,%d%n", rep, row[0], row[1], row[2]);
+            try (PrintWriter pw = new PrintWriter(new FileWriter(archivoConv))) {
+                pw.println("Replica,Dia,iteracion,ms_transcurridos,mejor_fitness,Criterio");
+            }
+
+            // 5. Bucle de réplicas
+            for (int rep = 1; rep <= replicasAEjecutar; rep++) {
+                long semilla = SEMILLAS[rep - 1];
+                System.out.printf("%n--- Réplica %d/%d (semilla=%d, criterio=%s) ---%n", 
+                    rep, replicasAEjecutar, semilla, criterio.name());
+
+                ActiveShipmentPool pool = new ActiveShipmentPool(10_000);
+                RouteStore routes = new RouteStore(10_000);
+                FlightCapacityStore flights = new FlightCapacityStore();
+                AirportCapacityTimeline airports =
+                        new AirportCapacityTimeline(DatosEstaticos.airportCode.length);
+
+                long currentTime = inicioUTC;
+                int diaRelativo = 0;
+                int replanificacionesTotal = 0;
+                int enviosLeidosTotal = 0;
+                String razonParadaReplica = "FIN_DATASET";
+                List<String> diarioRows = new ArrayList<>();
+
+                try (ShipmentStreamManager manager = new ShipmentStreamManager();
+                     PrintWriter pwConv = new PrintWriter(new FileWriter(archivoConv, true))) {
+                    while (manager.hasNextBefore(inicioUTC)) {
+                        manager.pollNext();
+                    }
+
+                    while (true) {
+                        if (enviosLeidosTotal >= maxEnviosPorReplica) {
+                            razonParadaReplica = "LIMITE_ENVIOS_MODO_RAPIDO";
+                            break;
+                        }
+
+                        long blockStart = currentTime;
+                        long blockEnd = blockStart + 1440L;
+
+                        int cupoLectura = Math.max(0, maxEnviosPorReplica - enviosLeidosTotal);
+                        int readsThisDay = cargarEnviosDelBloque(manager, blockStart, blockEnd, pool, routes, cupoLectura);
+                        enviosLeidosTotal += readsThisDay;
+
+                        List<Integer> criticos = new ArrayList<>();
+                        for (int i = 0; i < pool.getSize(); i++) {
+                            int status = pool.getStatus(i);
+                            if (status == ActiveShipmentPool.SIN_RUTA
+                                    || status == ActiveShipmentPool.PENDIENTE
+                                    || status == ActiveShipmentPool.RETRASADO) {
+                                criticos.add(i);
+                            }
+                        }
+
+                        ResultadoALNS resultadoALNS;
+                        long tiempoMs;
+                        if (criticos.isEmpty()) {
+                            resultadoALNS = new ResultadoALNS();
+                            tiempoMs = 0L;
+                        } else {
+                            long t0 = System.currentTimeMillis();
+                            PlanificadorALNS alns = new PlanificadorALNS(pool, routes, flights, airports, semilla, criterio);
+                            resultadoALNS = alns.ejecutarALNS(criticos, TIEMPO_LIMITE_NORMAL_MS, MAX_ITER_NORMAL);
+                            tiempoMs = System.currentTimeMillis() - t0;
+                            replanificacionesTotal++;
+                        }
+
+                        ResumenEstadoALNS resumen = resumirEstado(pool, blockEnd);
+
+                        diarioRows.add(String.format("%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s",
+                            rep, diaRelativo + 1, blockStart, blockEnd, readsThisDay,
+                            resumen.entregados, resumen.pendientes, resumen.sinRuta,
+                            resumen.retrasados, resumen.noFactibles, replanificacionesTotal,
+                            resultadoALNS.iteraciones, criterio.name()));
+
+                        System.out.printf("Día %d | leídos=%d | entregados=%d | pendientes=%d | sinRuta=%d | retrasados=%d | noFactibles=%d | iter=%d | %.1f s%n",
+                            diaRelativo + 1, readsThisDay, resumen.entregados, resumen.pendientes,
+                            resumen.sinRuta, resumen.retrasados, resumen.noFactibles,
+                            resultadoALNS.iteraciones, tiempoMs / 1000.0);
+
+                        if (resultadoALNS.convergencia != null) {
+                            for (long[] row : resultadoALNS.convergencia) {
+                                pwConv.printf("%d,%d,%d,%d,%d,%s%n",
+                                        rep, diaRelativo + 1, row[0], row[1], row[2], criterio.name());
+                            }
+                        }
+
+                        if (!manager.hasNext() && !hayEnviosPorResolver(resumen)) {
+                            razonParadaReplica = "FIN_DATASET";
+                            break;
+                        }
+
+                        if (readsThisDay == 0 && !hayEnviosPorResolver(resumen) && manager.hasNext()) {
+                            long siguienteInicio = (manager.peekNextReleaseUTC() / 1440L) * 1440L;
+                            currentTime = siguienteInicio;
+                            continue;
+                        }
+
+                        if (diaRelativo + 1 >= maxDiasPorReplica) {
+                            razonParadaReplica = "LIMITE_DIAS_MODO_RAPIDO";
+                            break;
+                        }
+
+                        currentTime = blockEnd;
+                        diaRelativo++;
+                        if (diaRelativo >= 3650) {
+                            razonParadaReplica = "LIMITE_SEGURIDAD";
+                            break;
+                        }
                     }
                 }
+
+                try (PrintWriter pw = new PrintWriter(new FileWriter(archivoDatos, true))) {
+                    for (String row : diarioRows) {
+                        pw.println(row);
+                    }
+                }
+
+                long[] metricasFinales = calcularMetricasPool(pool, routes);
+                long exitososFinales = metricasFinales[0];
+                long rechazadosFinales = metricasFinales[1];
+                double tasaFinal = enviosLeidosTotal > 0 ? exitososFinales * 100.0 / enviosLeidosTotal : 0;
+
+                System.out.printf("  Final | leidos=%,d | exitosos=%,d | rechazados=%,d | tasa=%.2f%% | razon=%s%n",
+                    enviosLeidosTotal, exitososFinales, rechazadosFinales, tasaFinal, razonParadaReplica);
             }
+
+            System.out.printf("\n====== EXPNUM ALNS [%s] COMPLETADO ======%n", criterio.name());
+            System.out.println("  " + archivoDatos);
+            System.out.println("  " + archivoConv);
         }
 
-        System.out.println("\n====== EXPNUM ALNS COMPLETADO ======");
-        System.out.println("  " + archivoDatos);
-        System.out.println("  " + archivoConv);
+        System.out.println("\n====== EXPNUM ALNS COMPLETADO (TODOS LOS CRITERIOS) ======");
     }
 
     // =========================================================================
@@ -593,6 +718,48 @@ public class MainALNS {
             routes.ensureCapacity(pool.getCapacity());
             pool.setStatus(idx, ActiveShipmentPool.PENDIENTE);
         }
+    }
+
+    /** Agrega al pool los envíos liberados dentro del bloque diario y devuelve el cursor actualizado. */
+    private static int cargarEnviosDelBloque(List<ShipmentRecord> envios, int cursor, long blockStart,
+            long blockEnd, ActiveShipmentPool pool, RouteStore routes) {
+        while (cursor < envios.size()) {
+            ShipmentRecord rec = envios.get(cursor);
+            if (rec.releaseUTC >= blockEnd) {
+                break;
+            }
+            cursor++;
+            if (rec.releaseUTC < blockStart) {
+                continue;
+            }
+            int idx = pool.addShipment(rec);
+            routes.ensureCapacity(pool.getCapacity());
+            pool.setStatus(idx, ActiveShipmentPool.PENDIENTE);
+        }
+        return cursor;
+    }
+
+    /** Lee por streaming los envíos del bloque diario y devuelve cuántos fueron agregados al pool. */
+    private static int cargarEnviosDelBloque(ShipmentStreamManager manager, long blockStart,
+            long blockEnd, ActiveShipmentPool pool, RouteStore routes, int maxLecturas) throws IOException {
+        if (maxLecturas <= 0) {
+            return 0;
+        }
+        int readsThisDay = 0;
+        while (manager.hasNextBefore(blockEnd) && readsThisDay < maxLecturas) {
+            ShipmentRecord rec = manager.pollNext();
+            if (rec == null) {
+                break;
+            }
+            if (rec.releaseUTC < blockStart) {
+                continue;
+            }
+            int idx = pool.addShipment(rec);
+            routes.ensureCapacity(pool.getCapacity());
+            pool.setStatus(idx, ActiveShipmentPool.PENDIENTE);
+            readsThisDay++;
+        }
+        return readsThisDay;
     }
 
     /**

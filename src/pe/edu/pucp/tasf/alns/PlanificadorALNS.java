@@ -1,6 +1,7 @@
 package pe.edu.pucp.tasf.alns;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
 
@@ -10,6 +11,8 @@ public class PlanificadorALNS {
     private FlightCapacityStore flights;
     private AirportCapacityTimeline airports;
     private final Random rand;
+    private final CriterioOrden criterio;
+    private final long semilla;
 
     // Pesos para operadores
     private double[] destroyWeights = {1,1,1,1,1};
@@ -19,16 +22,24 @@ public class PlanificadorALNS {
     private double[] destroyScores = {0,0,0,0,0};
     private double[] repairScores = {0,0,0,0};
 
+    /** Constructor reproducible con criterio de orden: pasa una semilla fija para experimentos. */
+    public PlanificadorALNS(ActiveShipmentPool p, RouteStore r, FlightCapacityStore f,
+                             AirportCapacityTimeline a, long seed, CriterioOrden crit) {
+        pool = p; routes = r; flights = f; airports = a;
+        semilla = seed;
+        rand = new Random(seed);
+        criterio = crit;
+    }
+
     /** Constructor reproducible: pasa una semilla fija para experimentos. */
     public PlanificadorALNS(ActiveShipmentPool p, RouteStore r, FlightCapacityStore f,
                              AirportCapacityTimeline a, long seed) {
-        pool = p; routes = r; flights = f; airports = a;
-        rand = new Random(seed);
+        this(p, r, f, a, seed, CriterioOrden.FIFO);
     }
 
     /** Constructor sin semilla (modo normal del compañero — no determinista). */
     public PlanificadorALNS(ActiveShipmentPool p, RouteStore r, FlightCapacityStore f, AirportCapacityTimeline a) {
-        this(p, r, f, a, System.currentTimeMillis());
+        this(p, r, f, a, System.currentTimeMillis(), CriterioOrden.FIFO);
     }
 
     public ResultadoALNS ejecutarALNS(List<Integer> criticos, long timeLimitMs) {
@@ -54,11 +65,14 @@ public class PlanificadorALNS {
             return resultado;
         }
 
+        // Ordenar críticos según el criterio
+        List<Integer> criticosOrdenados = ordenarCriticos(criticos);
+
         resultado.llamadasALNS = 1;
         resultado.sinRutaAntes = 0;
         resultado.pendientesAntes = 0;
         resultado.retrasadosAntes = 0;
-        for (int idx : criticos) {
+        for (int idx : criticosOrdenados) {
             int status = pool.getStatus(idx);
             if (status == ActiveShipmentPool.SIN_RUTA) {
                 resultado.sinRutaAntes++;
@@ -349,5 +363,39 @@ public class PlanificadorALNS {
         repairScores[ri] += score;
         destroyWeights[di] = Math.max(0.1, destroyScores[di] / destroyUses[di]);
         repairWeights[ri] = Math.max(0.1, repairScores[ri] / repairUses[ri]);
+    }
+
+    /**
+     * Ordena la lista de críticos según el criterio configurado.
+     * 
+     * <ul>
+     *   <li>{@link CriterioOrden#FIFO}: por releaseUTC ascendente (más antiguo primero).</li>
+     *   <li>{@link CriterioOrden#EDF}: por deadlineUTC ascendente (más urgente primero).</li>
+     *   <li>{@link CriterioOrden#ALEATORIO}: Fisher-Yates con semilla (reproducible).</li>
+     * </ul>
+     */
+    private List<Integer> ordenarCriticos(List<Integer> criticos) {
+        if (criterio == CriterioOrden.FIFO) {
+            // Ordenar por releaseUTC ascendente (orden de llegada)
+            List<Integer> ordenados = new ArrayList<>(criticos);
+            ordenados.sort((a, b) -> Long.compare(pool.getReleaseUTC(a), pool.getReleaseUTC(b)));
+            return ordenados;
+        } else if (criterio == CriterioOrden.EDF) {
+            // Ordenar por deadlineUTC ascendente (más urgente primero)
+            List<Integer> ordenados = new ArrayList<>(criticos);
+            ordenados.sort((a, b) -> Long.compare(pool.getDeadlineUTC(a), pool.getDeadlineUTC(b)));
+            return ordenados;
+        } else { // ALEATORIO
+            // Fisher-Yates shuffle con semilla reproducible
+            List<Integer> ordenados = new ArrayList<>(criticos);
+            Random rng = new Random(semilla);
+            for (int i = ordenados.size() - 1; i > 0; i--) {
+                int j = rng.nextInt(i + 1);
+                int temp = ordenados.get(i);
+                ordenados.set(i, ordenados.get(j));
+                ordenados.set(j, temp);
+            }
+            return ordenados;
+        }
     }
 }
