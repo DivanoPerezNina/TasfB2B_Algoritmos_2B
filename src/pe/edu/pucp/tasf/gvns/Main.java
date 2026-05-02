@@ -39,6 +39,9 @@ public class Main {
      */
     private static final boolean MODO_TECHO_TECNICO = false;
 
+    /** {@code true} → simula un día aleatorio completo con reporte detallado. */
+    private static final boolean MODO_SIM_DIA = false;
+
     /**
      * {@code true} → ejecuta el modo colapso (prueba de estrés con
      * estrangulamiento de red e inyección progresiva de carga).
@@ -96,6 +99,10 @@ public class Main {
     // =========================================================================
 
     public static void main(String[] args) {
+        if (MODO_SIM_DIA) {
+            simularDiaAleatorio();
+            return;
+        }
         if (MODO_TECHO_TECNICO) {
             ejecutarPruebaTechoTecnicoGVNS();
             return;
@@ -140,6 +147,241 @@ public class Main {
         } else {
             ejecutarEscenarioPeriodo(datos, inicioUTC, ESCENARIO);
         }
+    }
+
+    // =========================================================================
+    // SIMULACIÓN DÍA ALEATORIO — PLANIFICACIÓN COMPLETA 1 DÍA
+    // =========================================================================
+
+    /**
+     * Simula la planificación completa de un día elegido al azar dentro del
+     * dataset. Muestra en consola y exporta CSV con el detalle de cada envío:
+     * ruta asignada (vuelos + horas), tramos, tránsito y estado final.
+     *
+     * <p>Útil para demostrar que el GVNS planifica envío a envío respetando
+     * horarios reales, capacidades y deadlines SLA.
+     */
+    public static void simularDiaAleatorio() {
+        System.out.println("╔══════════════════════════════════════════════════════╗");
+        System.out.println("║   SIMULACIÓN DÍA ALEATORIO — GVNS TASF.B2B          ║");
+        System.out.println("╚══════════════════════════════════════════════════════╝");
+
+        // ── 1. Cargar red ─────────────────────────────────────────────────────
+        GestorDatos datos = new GestorDatos();
+        datos.cargarAeropuertos(RUTA_AEROPUERTOS);
+        if (datos.numAeropuertos == 0) { System.err.println("Sin aeropuertos."); return; }
+        datos.cargarVuelos(RUTA_VUELOS);
+
+        // ── 2. Elegir día aleatorio en 2026 (dataset: ene–dic 2026) ──────────
+        // Semilla basada en tiempo para garantizar reproducibilidad en el log.
+        long semillaDia = System.currentTimeMillis();
+        java.util.Random rnd = new java.util.Random(semillaDia);
+
+        // Intentar hasta encontrar un día con envíos (máx 50 intentos)
+        int  diaOffset = -1;
+        long ventanaIni = -1, ventanaFin = -1;
+        long baseUTC = GestorDatos.calcularEpochMinutos(2026, 1, 2, 0, 0, 0);
+
+        for (int intento = 0; intento < 50; intento++) {
+            diaOffset = rnd.nextInt(364);       // día 0..363 desde 2026-01-02
+            ventanaIni = baseUTC + (long) diaOffset * 1440L;
+            ventanaFin = ventanaIni + 1440L;
+            datos.resetEnvios();
+            datos.cargarTodosLosEnvios(RUTA_ENVIOS, ventanaIni, ventanaFin);
+            if (datos.numEnvios > 0) break;
+        }
+
+        if (datos.numEnvios == 0) {
+            System.err.println("No se encontraron envíos en ningún día aleatorio.");
+            return;
+        }
+
+        // Calcular fecha calendario aproximada (sin ZoneId: offset en días desde 2026-01-02)
+        int[] fecha = offsetAFechaSimple(diaOffset);
+        System.out.printf("%nDía seleccionado : %04d-%02d-%02d (semilla=%d)%n",
+                fecha[0], fecha[1], fecha[2], semillaDia);
+        System.out.printf("Ventana UTC      : [%d → %d] (1 440 min = 24 h)%n",
+                ventanaIni, ventanaFin);
+        System.out.printf("Envíos cargados  : %,d%n", datos.numEnvios);
+        System.out.printf("Vuelos en red    : %,d%n", datos.numVuelos);
+        System.out.printf("Aeropuertos      : %d%n%n", datos.numAeropuertos);
+
+        // ── 3. Ejecutar Fase 2 + GVNS ────────────────────────────────────────
+        PlanificadorGVNSConcurrente plan =
+                new PlanificadorGVNSConcurrente(datos, SEMILLA, CriterioOrden.EDF);
+
+        System.out.println("── FASE 2: Construcción greedy ──────────────────────────");
+        long t0 = System.currentTimeMillis();
+        plan.construirSolucionInicial();
+        long tFase2 = System.currentTimeMillis() - t0;
+
+        int exitososF2  = plan.enviosExitosos.get();
+        int rechazF2    = datos.numEnvios - exitososF2;
+        System.out.printf("Resultado Fase 2 : %,d exitosos | %,d rechazados | %.2f s%n%n",
+                exitososF2, rechazF2, tFase2 / 1000.0);
+
+        System.out.println("── FASE 3: Mejora GVNS (120 s) ──────────────────────────");
+        long t1 = System.currentTimeMillis();
+        int iterMejoras = plan.ejecutarMejoraGVNS();
+        long tFase3 = System.currentTimeMillis() - t1;
+
+        int exitososF3 = plan.enviosExitosos.get();
+        int rechazF3   = datos.numEnvios - exitososF3;
+        int salvados   = exitososF3 - exitososF2;
+
+        // ── 4. Estadísticas de la solución final ─────────────────────────────
+        System.out.println("\n╔══════════════════════════════════════════════════════╗");
+        System.out.println("║              RESULTADOS DE LA SIMULACIÓN             ║");
+        System.out.println("╚══════════════════════════════════════════════════════╝");
+        System.out.printf("  Total envíos      : %,d%n", datos.numEnvios);
+        System.out.printf("  Exitosos (final)  : %,d  (%.2f%%)%n",
+                exitososF3, exitososF3 * 100.0 / datos.numEnvios);
+        System.out.printf("  Rechazados (final): %,d  (%.2f%%)%n",
+                rechazF3, rechazF3 * 100.0 / datos.numEnvios);
+        System.out.printf("  Salvados por GVNS : %,d%n", salvados);
+        System.out.printf("  Mejoras aceptadas : %,d%n", iterMejoras);
+        System.out.printf("  Tiempo Fase 2     : %.2f s%n", tFase2 / 1000.0);
+        System.out.printf("  Tiempo Fase 3     : %.2f s%n", tFase3 / 1000.0);
+        System.out.printf("  Tránsito total    : %,d min%n%n", plan.calcularTransitoTotal());
+
+        // ── 5. Distribución por número de tramos ─────────────────────────────
+        int[] porTramos = new int[4]; // [0]=rechazado,[1]=directo,[2]=1escala,[3]=2escalas
+        long  transitoMin = Long.MAX_VALUE, transitoMax = 0, transitoSum = 0;
+        for (int e = 0; e < datos.numEnvios; e++) {
+            if (plan.solucionVuelos[e][0] == -1) { porTramos[0]++; continue; }
+            int tramos = 1;
+            for (int s = 1; s < plan.MAX_SALTOS; s++)
+                if (plan.solucionVuelos[e][s] != -1) tramos++;
+            porTramos[tramos]++;
+
+            // Calcular tránsito individual
+            int ultimo = tramos - 1;
+            long llegada = plan.solucionDias[e][ultimo]
+                    + (datos.vueloLlegadaUTC[plan.solucionVuelos[e][ultimo]]
+                       - datos.vueloSalidaUTC[plan.solucionVuelos[e][ultimo]]
+                       + (datos.vueloLlegadaUTC[plan.solucionVuelos[e][ultimo]] < datos.vueloSalidaUTC[plan.solucionVuelos[e][ultimo]] ? 1440 : 0));
+            long tr = llegada - datos.envioRegistroUTC[e];
+            if (tr > 0) {
+                transitoSum += tr;
+                if (tr < transitoMin) transitoMin = tr;
+                if (tr > transitoMax) transitoMax = tr;
+            }
+        }
+        double transitoPromedio = exitososF3 > 0 ? (double) transitoSum / exitososF3 : 0;
+
+        System.out.println("── Distribución por tipo de ruta ────────────────────────");
+        System.out.printf("  Vuelo directo (1 tramo) : %,d  (%.1f%%)%n",
+                porTramos[1], porTramos[1] * 100.0 / datos.numEnvios);
+        System.out.printf("  1 escala     (2 tramos) : %,d  (%.1f%%)%n",
+                porTramos[2], porTramos[2] * 100.0 / datos.numEnvios);
+        System.out.printf("  2 escalas    (3 tramos) : %,d  (%.1f%%)%n",
+                porTramos[3], porTramos[3] * 100.0 / datos.numEnvios);
+        System.out.printf("  Sin ruta (rechazados)   : %,d  (%.1f%%)%n",
+                porTramos[0], porTramos[0] * 100.0 / datos.numEnvios);
+        System.out.printf("%n  Tránsito promedio : %.1f min%n", transitoPromedio);
+        System.out.printf("  Tránsito mínimo   : %s min%n",
+                transitoMin == Long.MAX_VALUE ? "N/A" : String.valueOf(transitoMin));
+        System.out.printf("  Tránsito máximo   : %,d min%n%n", transitoMax == 0 ? 0 : transitoMax);
+
+        // ── 6. Top-10 rutas más frecuentes ───────────────────────────────────
+        java.util.Map<String, Integer> frecRutas = new java.util.HashMap<>();
+        for (int e = 0; e < datos.numEnvios; e++) {
+            if (plan.solucionVuelos[e][0] == -1) continue;
+            StringBuilder sb = new StringBuilder();
+            sb.append(datos.iataAeropuerto[datos.envioOrigen[e]]);
+            for (int s = 0; s < plan.MAX_SALTOS; s++) {
+                int v = plan.solucionVuelos[e][s];
+                if (v == -1) break;
+                sb.append(" →[v").append(v).append("]→ ");
+                sb.append(datos.iataAeropuerto[datos.vueloDestino[v]]);
+            }
+            String clave = sb.toString();
+            frecRutas.merge(clave, 1, Integer::sum);
+        }
+        System.out.println("── Top-10 rutas más usadas ──────────────────────────────");
+        frecRutas.entrySet().stream()
+                .sorted((a, b) -> b.getValue() - a.getValue())
+                .limit(10)
+                .forEach(en -> System.out.printf("  %5d envíos  %s%n", en.getValue(), en.getKey()));
+
+        // ── 7. Exportar CSV detalle por envío ────────────────────────────────
+        String carpeta = "resultados_sim_dia";
+        new File(carpeta).mkdirs();
+        String csvSalida = String.format("%s/simulacion_%04d%02d%02d.csv",
+                carpeta, fecha[0], fecha[1], fecha[2]);
+
+        try (PrintWriter pw = new PrintWriter(new FileWriter(csvSalida))) {
+            pw.println("envio_id,origen,destino,maletas,registro_utc,deadline_utc,"
+                     + "estado,tramos,vuelo1,salida1_utc,vuelo2,salida2_utc,"
+                     + "vuelo3,salida3_utc,transito_min");
+            for (int e = 0; e < datos.numEnvios; e++) {
+                String estado;
+                int    tramos = 0;
+                int[]  vuelos = {-1,-1,-1};
+                long[] sals   = {-1,-1,-1};
+                long   tr     = -1;
+
+                if (plan.solucionVuelos[e][0] == -1) {
+                    estado = "RECHAZADO";
+                } else {
+                    for (int s = 0; s < plan.MAX_SALTOS; s++) {
+                        if (plan.solucionVuelos[e][s] == -1) break;
+                        vuelos[tramos] = plan.solucionVuelos[e][s];
+                        sals  [tramos] = plan.solucionDias  [e][s];
+                        tramos++;
+                    }
+                    estado = "EXITOSO";
+                    int ultimo = tramos - 1;
+                    long lle = sals[ultimo]
+                            + (datos.vueloLlegadaUTC[vuelos[ultimo]]
+                               - datos.vueloSalidaUTC[vuelos[ultimo]]
+                               + (datos.vueloLlegadaUTC[vuelos[ultimo]] < datos.vueloSalidaUTC[vuelos[ultimo]] ? 1440 : 0));
+                    tr = lle - datos.envioRegistroUTC[e];
+                }
+
+                pw.printf("%d,%s,%s,%d,%d,%d,%s,%d,%d,%d,%d,%d,%d,%d,%d%n",
+                        e,
+                        datos.iataAeropuerto[datos.envioOrigen[e]],
+                        datos.iataAeropuerto[datos.envioDestino[e]],
+                        datos.envioMaletas[e],
+                        datos.envioRegistroUTC[e],
+                        datos.envioDeadlineUTC[e],
+                        estado,
+                        tramos,
+                        vuelos[0], sals[0],
+                        vuelos[1], sals[1],
+                        vuelos[2], sals[2],
+                        tr);
+            }
+        } catch (Exception ex) {
+            System.err.println("Error exportando CSV: " + ex.getMessage());
+        }
+
+        System.out.printf("%n── CSV exportado ────────────────────────────────────────%n");
+        System.out.printf("  %s%n", new File(csvSalida).getAbsolutePath());
+
+        // Convergencia GVNS
+        String csvConv = String.format("%s/convergencia_%04d%02d%02d.csv",
+                carpeta, fecha[0], fecha[1], fecha[2]);
+        plan.exportarHistorialConvergenciaCSV(csvConv);
+
+        System.out.println("\n╔══════════════════════════════════════════════════════╗");
+        System.out.println("║               SIMULACIÓN COMPLETADA                 ║");
+        System.out.println("╚══════════════════════════════════════════════════════╝");
+    }
+
+    /** Convierte offset de días desde 2026-01-02 a {año, mes, día}. */
+    private static int[] offsetAFechaSimple(int offsetDias) {
+        int[] diasMes = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+        int dia = 2 + offsetDias;
+        int mes = 1;
+        int anio = 2026;
+        while (dia > diasMes[mes]) {
+            dia -= diasMes[mes];
+            mes++;
+            if (mes > 12) { mes = 1; anio++; }
+        }
+        return new int[]{anio, mes, dia};
     }
 
     // =========================================================================
