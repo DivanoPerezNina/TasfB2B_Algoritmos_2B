@@ -304,7 +304,10 @@ public class Main {
                 .limit(10)
                 .forEach(en -> System.out.printf("  %5d envíos  %s%n", en.getValue(), en.getKey()));
 
-        // ── 7. Exportar CSV detalle por envío ────────────────────────────────
+        // ── 7. Validar invariantes de la solución ────────────────────────────
+        AnalizadorRed.validarSolucion(plan, datos);
+
+        // ── 8. Exportar CSV detalle por envío ────────────────────────────────
         String carpeta = "resultados_sim_dia";
         new File(carpeta).mkdirs();
         String csvSalida = String.format("%s/simulacion_%04d%02d%02d.csv",

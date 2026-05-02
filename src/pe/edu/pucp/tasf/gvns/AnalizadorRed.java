@@ -196,7 +196,157 @@ public final class AnalizadorRed {
         System.out.println("===================================================\n");
     }
 
+    // =========================================================================
+    // VALIDADOR DE SOLUCIÓN — 5 INVARIANTES
+    // =========================================================================
+
+    /**
+     * Verifica que la solución del planificador cumple todos los invariantes
+     * matemáticos del problema. Imprime en consola cada violación encontrada
+     * (hasta 20 ejemplos) y un resumen final.
+     *
+     * <p>Invariantes comprobados:
+     * <ol>
+     *   <li>Causalidad temporal: salida ≥ registro del envío.</li>
+     *   <li>Continuidad de ruta: destino(tramo n) == origen(tramo n+1).</li>
+     *   <li>Conexión mínima: salida(n+1) ≥ llegada(n) + 10 min.</li>
+     *   <li>SLA cumplido: llegada final ≤ deadline del envío.</li>
+     *   <li>Sin overbooking: Σ maletas por (vuelo, día) ≤ capacidad.</li>
+     * </ol>
+     *
+     * @return {@code true} si la solución no tiene ninguna violación.
+     */
+    public static boolean validarSolucion(PlanificadorGVNSConcurrente plan,
+                                          GestorDatos datos) {
+        System.out.println("\n╔══════════════════════════════════════════════════════╗");
+        System.out.println("║            VALIDADOR DE SOLUCIÓN GVNS               ║");
+        System.out.println("╚══════════════════════════════════════════════════════╝");
+
+        int violCausalidad  = 0;
+        int violContinuidad = 0;
+        int violConexion    = 0;
+        int violSLA         = 0;
+        int ejemplosMostrados = 0;
+
+        final int MAX_EJEMPLOS  = 20;
+        final int ESCALA_MINIMA = 10;   // minutos mínimos entre tramos
+
+        for (int e = 0; e < datos.numEnvios; e++) {
+            if (plan.solucionVuelos[e][0] == -1) continue; // rechazado: ok, no aplica
+
+            long tRegistro = datos.envioRegistroUTC[e];
+            long deadline  = datos.envioDeadlineUTC[e];
+            long llegadaAnterior = tRegistro; // se actualiza tramo a tramo
+
+            for (int s = 0; s < plan.MAX_SALTOS; s++) {
+                int  v   = plan.solucionVuelos[e][s];
+                long sal = plan.solucionDias[e][s];
+                if (v == -1) break;
+
+                long dur    = duracionVuelo(datos, v);
+                long llegada = sal + dur;
+
+                // ── Invariante 1: causalidad ──────────────────────────────────
+                if (s == 0 && sal < tRegistro) {
+                    violCausalidad++;
+                    if (ejemplosMostrados++ < MAX_EJEMPLOS)
+                        System.out.printf("  [CAUSALIDAD]  envio=%d  sal=%d < reg=%d%n",
+                                e, sal, tRegistro);
+                }
+
+                // ── Invariante 2: continuidad de ruta ─────────────────────────
+                if (s > 0) {
+                    int vPrev   = plan.solucionVuelos[e][s - 1];
+                    int dstPrev = datos.vueloDestino[vPrev];
+                    int oriCurr = datos.vueloOrigen[v];
+                    if (dstPrev != oriCurr) {
+                        violContinuidad++;
+                        if (ejemplosMostrados++ < MAX_EJEMPLOS)
+                            System.out.printf(
+                                "  [CONTINUIDAD] envio=%d tramo%d→%d: %s→[salto]→%s%n",
+                                e, s-1, s,
+                                iata(datos, dstPrev), iata(datos, oriCurr));
+                    }
+                }
+
+                // ── Invariante 3: conexión mínima ─────────────────────────────
+                if (s > 0 && sal < llegadaAnterior + ESCALA_MINIMA) {
+                    violConexion++;
+                    if (ejemplosMostrados++ < MAX_EJEMPLOS)
+                        System.out.printf(
+                            "  [CONEXION]    envio=%d tramo%d: sal=%d < llegPrev+10=%d%n",
+                            e, s, sal, llegadaAnterior + ESCALA_MINIMA);
+                }
+
+                llegadaAnterior = llegada;
+
+                // ── Invariante 4: SLA (solo en el último tramo) ───────────────
+                boolean esUltimo = (s + 1 >= plan.MAX_SALTOS || plan.solucionVuelos[e][s+1] == -1);
+                if (esUltimo && llegada > deadline) {
+                    violSLA++;
+                    if (ejemplosMostrados++ < MAX_EJEMPLOS)
+                        System.out.printf(
+                            "  [SLA]         envio=%d llegada=%d > deadline=%d (+%d min)%n",
+                            e, llegada, deadline, llegada - deadline);
+                }
+            }
+        }
+
+        // ── Invariante 5: sin overbooking (agrupa maletas por vuelo-día) ──────
+        java.util.HashMap<Long, Integer> ocupacion = new java.util.HashMap<>();
+        for (int e = 0; e < datos.numEnvios; e++) {
+            for (int s = 0; s < plan.MAX_SALTOS; s++) {
+                int  v   = plan.solucionVuelos[e][s];
+                long sal = plan.solucionDias[e][s];
+                if (v == -1) break;
+                long key = (long) v * 100_000L + (sal / 1440L);
+                ocupacion.merge(key, datos.envioMaletas[e], Integer::sum);
+            }
+        }
+        int violOverbooking = 0;
+        for (java.util.Map.Entry<Long, Integer> en : ocupacion.entrySet()) {
+            int v   = (int)(en.getKey() / 100_000L);
+            int ocu = en.getValue();
+            int cap = datos.vueloCapacidad[v];
+            if (ocu > cap) {
+                violOverbooking++;
+                if (violOverbooking <= 5)
+                    System.out.printf(
+                        "  [OVERBOOKING] vuelo=%d día=%d  carga=%d > cap=%d%n",
+                        v, (int)(en.getKey() % 100_000L), ocu, cap);
+            }
+        }
+
+        // ── Resumen ───────────────────────────────────────────────────────────
+        int totalViol = violCausalidad + violContinuidad + violConexion
+                      + violSLA + violOverbooking;
+        System.out.println("\n── Resultado ────────────────────────────────────────────");
+        System.out.printf("  Causalidad temporal  : %s%n", fmt(violCausalidad));
+        System.out.printf("  Continuidad de ruta  : %s%n", fmt(violContinuidad));
+        System.out.printf("  Conexión mínima 10m  : %s%n", fmt(violConexion));
+        System.out.printf("  SLA incumplido       : %s%n", fmt(violSLA));
+        System.out.printf("  Overbooking vuelo-día: %s%n", fmt(violOverbooking));
+        if (totalViol == 0) {
+            System.out.println("\n  ✓ SOLUCIÓN VÁLIDA — ninguna violación detectada");
+        } else {
+            System.out.printf("%n  ✗ %d VIOLACIÓN(ES) — revisar lógica del algoritmo%n",
+                    totalViol);
+        }
+        System.out.println("─────────────────────────────────────────────────────────");
+        return totalViol == 0;
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private static long duracionVuelo(GestorDatos datos, int v) {
+        int sal = datos.vueloSalidaUTC[v];
+        int lle = datos.vueloLlegadaUTC[v];
+        return (lle >= sal) ? (lle - sal) : (1440 - sal + lle); // cruza medianoche
+    }
+
+    private static String fmt(int n) {
+        return n == 0 ? "OK (0)" : "!!! " + n + " violaciones";
+    }
 
     private static double pct(int parte, int total) {
         return (total == 0) ? 0.0 : parte * 100.0 / total;
