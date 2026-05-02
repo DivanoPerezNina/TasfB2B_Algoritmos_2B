@@ -3,6 +3,7 @@ package pe.edu.pucp.tasf.gvns;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.PrintWriter;
+import java.util.Arrays;
 
 /**
  * Main — Punto de entrada del motor de planificación logística Tasf.B2B.
@@ -54,6 +55,13 @@ public class Main {
 
     /** Capacidad máxima por vuelo durante el estrangulamiento de red. */
     private static final int CAP_ESTRANGULAMIENTO = 50;
+
+    /**
+     * Factor de escala de maletas para el escenario COLAPSO día-a-día.
+     * Cada envío del día tendrá envioMaletas *= FACTOR_ESCALA_COLAPSO.
+     * 1.0 = demanda real; >1.0 = estrés de red (comparable con ALNS).
+     */
+    private static final double FACTOR_ESCALA_COLAPSO = 10.0;
 
     /** Escenario activo. Solo aplica cuando {@code MODO_EXPNUM = false}. */
     private static final Escenario ESCENARIO = Escenario.PERIODO_3D;
@@ -549,64 +557,95 @@ public class Main {
      * @param inicioUTC Minuto UTC absoluto del primer día.
      */
     private static void ejecutarEscenarioColapso(GestorDatos datos, long inicioUTC) {
-        System.out.printf("%n--- ESCENARIO: COLAPSO (umbral=%.0f%%) ---%n",
-                UMBRAL_COLAPSO * 100);
+        System.out.printf("%n--- ESCENARIO: COLAPSO DÍA A DÍA (factor=%.1f×) ---%n",
+                FACTOR_ESCALA_COLAPSO);
+
+        String carpeta = "resultados_colapso_diario";
+        new File(carpeta).mkdirs();
+        String csvDiario = carpeta + "/colapso_diario_f"
+                + String.format("%.0f", FACTOR_ESCALA_COLAPSO) + "x.csv";
 
         int     diaActual        = 0;
         int     diasSinEnvios    = 0;
         boolean colapsoDetectado = false;
 
-        while (!colapsoDetectado) {
-            long ventanaIni = inicioUTC + (long) diaActual * 1440L;
-            long ventanaFin = ventanaIni + 1440L;
+        try (PrintWriter pw = new PrintWriter(new FileWriter(csvDiario))) {
+            pw.println("dia,fecha_utc_ini,envios,exitosos,rechazados,pct_rechazados,colapso");
 
-            datos.resetEnvios();
-            datos.cargarTodosLosEnvios(RUTA_ENVIOS, ventanaIni, ventanaFin);
+            while (!colapsoDetectado) {
+                long ventanaIni = inicioUTC + (long) diaActual * 1440L;
+                long ventanaFin = ventanaIni + 1440L;
 
-            if (datos.numEnvios == 0) {
-                diasSinEnvios++;
-                System.out.printf("Día %2d: sin envíos en ventana.%n", diaActual + 1);
-                if (diasSinEnvios >= 3) {
-                    System.out.println("3 días consecutivos sin datos. Fin de la simulación.");
+                datos.resetEnvios();
+                datos.cargarTodosLosEnvios(RUTA_ENVIOS, ventanaIni, ventanaFin);
+
+                if (datos.numEnvios == 0) {
+                    diasSinEnvios++;
+                    System.out.printf("Día %2d: sin envíos en ventana.%n", diaActual + 1);
+                    if (diasSinEnvios >= 3) {
+                        System.out.println("3 días consecutivos sin datos. Fin de la simulación.");
+                        break;
+                    }
+                    diaActual++;
+                    continue;
+                }
+                diasSinEnvios = 0;
+                System.out.printf("%n=== DÍA %d | %,d envíos (factor %.1f×) ===%n",
+                        diaActual + 1, datos.numEnvios, FACTOR_ESCALA_COLAPSO);
+
+                // Escalar maletas del día y guardar originales
+                int[] maletasBase = Arrays.copyOf(datos.envioMaletas, datos.numEnvios);
+                for (int i = 0; i < datos.numEnvios; i++)
+                    datos.envioMaletas[i] = Math.max(1,
+                            (int) Math.round(maletasBase[i] * FACTOR_ESCALA_COLAPSO));
+
+                PlanificadorGVNSConcurrente plan =
+                        new PlanificadorGVNSConcurrente(datos, SEMILLA, CRITERIO_ORDEN);
+
+                long t0 = System.currentTimeMillis();
+                plan.construirSolucionInicial();
+                if (plan.enviosExitosos.get() < datos.numEnvios)
+                    plan.ejecutarMejoraGVNS();
+                double tSeg = (System.currentTimeMillis() - t0) / 1000.0;
+
+                // Restaurar maletas originales
+                System.arraycopy(maletasBase, 0, datos.envioMaletas, 0, datos.numEnvios);
+
+                int    exitosos   = plan.enviosExitosos.get();
+                int    rechazados = datos.numEnvios - exitosos;
+                double pct        = rechazados * 100.0 / datos.numEnvios;
+                boolean colapso   = rechazados > 0;
+
+                System.out.printf("Día %3d | Exitosos: %,d | Rechazados: %,d (%.2f%%) | t=%.1fs%s%n",
+                        diaActual + 1, exitosos, rechazados, pct, tSeg,
+                        colapso ? " *** COLAPSO ***" : "");
+
+                pw.printf("%d,%d,%d,%d,%d,%.4f,%s%n",
+                        diaActual + 1, ventanaIni,
+                        datos.numEnvios, exitosos, rechazados, pct,
+                        colapso ? "SI" : "NO");
+                pw.flush();
+
+                if (colapso) {
+                    System.out.printf("%n*** PRIMER COLAPSO en día %d con factor %.1f× ***%n",
+                            diaActual + 1, FACTOR_ESCALA_COLAPSO);
+                    colapsoDetectado = true;
+                }
+
+                diaActual++;
+                if (diaActual > 365) {
+                    System.out.println("Límite: 365 días simulados sin colapso con este factor.");
                     break;
                 }
-                diaActual++;
-                continue;
             }
-            diasSinEnvios = 0;
-            System.out.printf("%n=== DÍA %d | %,d envíos ===%n", diaActual + 1, datos.numEnvios);
-
-            PlanificadorGVNSConcurrente plan =
-                    new PlanificadorGVNSConcurrente(datos, SEMILLA, CRITERIO_ORDEN);
-
-            long t0 = System.currentTimeMillis();
-            plan.construirSolucionInicial();
-            plan.ejecutarMejoraGVNS();
-            double tSeg = (System.currentTimeMillis() - t0) / 1000.0;
-
-            int    exitosos   = plan.enviosExitosos.get();
-            int    rechazados = datos.numEnvios - exitosos;
-            double tasa       = (double) rechazados / datos.numEnvios;
-
-            System.out.printf("Día %2d | Exitosos: %,d | Rechazados: %,d (%.1f%%) | t=%.1fs%n",
-                    diaActual + 1, exitosos, rechazados, tasa * 100, tSeg);
-
-            if (tasa >= UMBRAL_COLAPSO) {
-                System.out.printf(
-                        "%n*** COLAPSO en día %d: %.1f%% rechazados (umbral=%.0f%%) ***%n",
-                        diaActual + 1, tasa * 100, UMBRAL_COLAPSO * 100);
-                colapsoDetectado = true;
-            }
-
-            diaActual++;
-            if (diaActual > 365) {
-                System.out.println("Límite de seguridad: 365 días simulados sin colapso.");
-                break;
-            }
+        } catch (Exception ex) {
+            System.err.println("Error CSV colapso diario: " + ex.getMessage());
         }
 
+        System.out.printf("%nCSV día a día: %s%n", new File(csvDiario).getAbsolutePath());
         if (!colapsoDetectado)
-            System.out.println("\nFin de datos sin detectar colapso.");
+            System.out.printf("No hubo colapso en %d días con factor %.1f×%n",
+                    diaActual, FACTOR_ESCALA_COLAPSO);
     }
 
     // =========================================================================
